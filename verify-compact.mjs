@@ -1,5 +1,5 @@
 // 验证 v23 的 /compact 分流：不需要真的起 dsh，用假 ctx 跑一遍 apply。
-import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, DEFAULTS } from './main.v20.mjs'
+import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, DEFAULTS } from './main.v20.mjs'
 import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
@@ -593,6 +593,50 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
   // 调用点⑤（显示名）：关掉后没有 mcp__dsh__ 名字流进来，映射自然是空转
   check('⑤ 关掉后原生名字原样通过', bridgeDisplayName('Read') === 'Read' && bridgeDisplayName('Bash') === 'Bash')
   check('⑤ 真外挂 MCP 名字始终不动', bridgeDisplayName('mcp__filesystem__write_file') === 'mcp__filesystem__write_file')
+}
+
+// ── ⑥ replay 隔离标记（v31）────────────────────────────────────────────
+// 全量 replay 把整段历史的活动块一次性灌进 prompt。这些块是纯文本，和模型
+// 自己的正文之间没有边界，于是模型把这个形状当成可续写的输出格式，在正文
+// 末尾伪造出下一次调用的卡片头（实测：resume 的 6 轮 0 处，重启后全量
+// replay 那一轮 11 处）。标签把它们标成结构化记录而不是待模仿的样式。
+{
+  const activity = (name, summary, output = 'ok') => buildToolActivityBlock(
+    { name, input: { description: summary } }, output, false,
+  )
+  const one = serializeConversation([{ role: 'assistant', content: [activity('Bash', 'git status')] }])
+  check('⑥ 活动块 replay 带隔离标记',
+    one.includes('<tool-activity>') && one.includes('</tool-activity>'), one.slice(0, 90))
+  check('⑥ 标记内保留 ▸ sentinel（replayText 靠它识别活动块）',
+    one.includes('<tool-activity>\n▸ Bash ✓ · git status\n$ git status'), one.slice(0, 140))
+
+  // fold 模式的活动块走 reasoning 通道，文本自身以 ▸ 开头
+  const fold = serializeConversation([
+    { role: 'assistant', content: [{ type: 'reasoning', text: '▸ Bash ✓ · ls\n$ ls\n\nout' }] },
+  ])
+  check('⑥ fold 活动块同样被隔离', fold.includes('<tool-activity>'), fold)
+  const legacy = serializeConversation([
+    { role: 'assistant', content: [{ type: 'text', text: '‹ Bash ✓ out' }] },
+  ])
+  check('⑥ legacy ‹ 前缀同样被隔离', legacy.includes('<tool-activity>'), legacy)
+
+  // 真实思考与正文绝不能被包裹 —— 那等于把这个形状教给它
+  const prose = serializeConversation([
+    { role: 'assistant', content: [
+      { type: 'reasoning', text: '我在想这个问题' },
+      { type: 'text', text: '结论是这样' },
+    ] },
+  ])
+  check('⑥ 真实思考与正文不被包裹', !prose.includes('<tool-activity>'), prose)
+
+  // 裁剪仍生效；标签是固定开销，不占内容预算
+  const long = serializeConversation([
+    { role: 'assistant', content: [activity('Bash', 'build', 'x'.repeat(3000))] },
+  ])
+  check('⑥ 超长活动块仍被裁剪', long.includes('… [replay truncated]'), long.slice(-60))
+  const head = '<tool-activity>\n'
+  const inner = long.slice(long.indexOf(head) + head.length, long.lastIndexOf('\n</tool-activity>'))
+  check('⑥ 标签在裁剪预算之外', inner.length <= 800 + '\n… [replay truncated]'.length, `inner=${inner.length}`)
 }
 
 console.log(`\n${fail === 0 ? 'all checks passed' : fail + ' FAILED'} (${pass} passed)`)

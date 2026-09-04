@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-claude-code",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "DSH host plugin: route a DSH conversation to a real Claude Code session through the Agent SDK. Bridges DSH's bash/read/write/edit/todo_write tools into the inner session (switching the native equivalents off), renders every inner tool call as a live card, maps DSH's read-only and plan modes onto the inner permission mode, and routes /compact and /goal to whichever side owns them.",
   "type": "module",
   "main": "./index.js",

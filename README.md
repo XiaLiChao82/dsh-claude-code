@@ -96,7 +96,7 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 ## 测试
 
 ```bash
-node verify-compact.mjs   # 自检，164 项（放在 profile 目录下跑是 167 项）
+node verify-compact.mjs   # 自检，171 项（无条件分支，从哪跑都一样）
 node checkup.mjs          # 体检，39 项（打了 rc.2 回退补丁后是 40 项）
 node checkup.mjs --live   # 额外探测 Claude Code 的输出格式，要真起一次会话，约一分钟
 ```

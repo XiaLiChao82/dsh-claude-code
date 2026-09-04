@@ -512,14 +512,45 @@ export async function prepareImageBlocks(refs, attachments, policy, signal) {
 // needs to recall its own prior inner-tool output.
 const REPLAY_STATUS_MAX_CHARS = 800
 
+// v31 wraps every replayed activity block in `<tool-activity>` tags.
+//
+// WHY: these blocks are plain text — `▸ Bash ✓ · desc\n$ desc\n\n<output>` —
+// with no boundary between them and the model's own prose. A FULL replay
+// (planReplay's 'full' mode: guaranteed after a host restart, since
+// resumeState is in-memory, and also on edits, deletions, regeneration
+// branches, retries and forks) dumps the entire history's worth of these
+// blocks into one prompt. Claude then reads the shape as an output format it
+// may continue, and starts DRAWING the next tool's card at the end of its
+// prose — inventing a `▸ Bash · desc\n$ desc` header for a call it has not
+// made yet. Measured on this session: 0 occurrences across six resumed
+// turns, then 11 in the single full-replay turn right after a restart.
+// The tag makes each block a structural record instead of a style to mimic.
+//
+// The `▸ ` sentinel stays INSIDE the tag: replayText below identifies
+// activity blocks by that prefix, and the tag already supplies the isolation.
+//
+// Scope: prompt text only. The DSH transcript renders from
+// buildToolActivityBlock's structured data, so display is untouched.
+const ACTIVITY_REPLAY_OPEN = '<tool-activity>'
+const ACTIVITY_REPLAY_CLOSE = '</tool-activity>'
+
+/** Clamp to the replay budget, then isolate. Tags are outside the budget. */
+function wrapActivityReplay(text) {
+  const clamped = text.length > REPLAY_STATUS_MAX_CHARS
+    ? `${text.slice(0, REPLAY_STATUS_MAX_CHARS).trimEnd()}\n… [replay truncated]`
+    : text
+  return `${ACTIVITY_REPLAY_OPEN}\n${clamped}\n${ACTIVITY_REPLAY_CLOSE}`
+}
+
 function replayText(block) {
   const text = block?.text ?? ''
   const kind = block?.type
   // `‹ ` marks the legacy v8–v13 text status blocks; `▸ ` marks the v15 fold
   // blocks carried on the reasoning channel. Genuine Claude thinking never
-  // starts with either sentinel, so it keeps replaying unclamped.
-  if ((kind === 'text' || kind === 'reasoning') && (text.startsWith('‹ ') || text.startsWith('▸ ')) && text.length > REPLAY_STATUS_MAX_CHARS) {
-    return `${text.slice(0, REPLAY_STATUS_MAX_CHARS).trimEnd()}\n… [replay truncated]`
+  // starts with either sentinel, so it keeps replaying unclamped AND unwrapped
+  // — wrapping real prose would teach the very shape this guards against.
+  if ((kind === 'text' || kind === 'reasoning') && (text.startsWith('‹ ') || text.startsWith('▸ '))) {
+    return wrapActivityReplay(text)
   }
   return text
 }
@@ -530,9 +561,7 @@ function activityReplayLine(block) {
   const summary = [input.description, input.command, input.file_path, input.path, input.pattern, input.query, input.url]
     .find((value) => typeof value === 'string' && value.length > 0) || ''
   const output = typeof block?.output === 'string' ? block.output : ''
-  const text = `▸ ${block?.name ?? 'tool'} ${mark} · ${summary}\n$ ${summary}\n\n${output}`
-  if (text.length > REPLAY_STATUS_MAX_CHARS) return `${text.slice(0, REPLAY_STATUS_MAX_CHARS).trimEnd()}\n… [replay truncated]`
-  return text
+  return wrapActivityReplay(`▸ ${block?.name ?? 'tool'} ${mark} · ${summary}\n$ ${summary}\n\n${output}`)
 }
 
 function blockText(block, images) {
