@@ -1,0 +1,16 @@
+# 依赖目录：里面全是指向 ~/.dsh 的软链接，换台机器就失效，不能提交
+node_modules/
+
+# 备份文件（改动前留的副本，只在本机有意义）
+*.bak
+
+# 本机 npm 缓存（这台机器的全局缓存属于 root，只能用本地缓存）
+.npm-cache/
+
+# 生成物：跑 make-probe-image.mjs 就能重新生成，不必入库
+probe-stripes.png
+
+# 编辑器与系统垃圾文件
+.DS_Store
+*.swp
+*~
