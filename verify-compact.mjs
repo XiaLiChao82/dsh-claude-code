@@ -1,5 +1,5 @@
 // 验证 v23 的 /compact 分流：不需要真的起 dsh，用假 ctx 跑一遍 apply。
-import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, DEFAULTS } from './main.v20.mjs'
+import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, appendMirrorEvent, buildMirrorChildMeta, buildMirrorDescriptor, buildMirrorToolCallBlock, buildMirrorToolResultBlock, buildMirrorUserEvent, buildMirrorAssistantEvent, buildMirrorToolResultEvent, createMirrorCollector, MIRROR_DESCRIPTOR_VERSION, DEFAULTS } from './main.v20.mjs'
 import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
@@ -637,6 +637,196 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
   const head = '<tool-activity>\n'
   const inner = long.slice(long.indexOf(head) + head.length, long.lastIndexOf('\n</tool-activity>'))
   check('⑥ 标签在裁剪预算之外', inner.length <= 800 + '\n… [replay truncated]'.length, `inner=${inner.length}`)
+}
+
+// ── ⑦ 子代理镜像的事件形状 ────────────────────────────────────────────
+//
+// 这组断言守的是 DSH 会话存储格式里【只在第三层校验器（projection fold）才
+// 暴露】的三个陷阱。为什么必须在这里守：
+//
+//   · Session.append 会接受错误形状
+//   · sessionPersistence.append 会把它落盘
+//   · 同进程 persistence.inspect() 会原样读回来，一切看着正常
+//   · 只有 projection fold 抛错，而 listChildren 把真错吞成
+//     corrupt/unavailable/unsupported 三选一
+//
+// 结果就是：形状写错不会让任何测试变红，而是变成用户界面上的
+// 「会话记录损坏」。三处形状实测都踩过，下面按「正向断言 + 反向断言」成对
+// 写——只断言正确字段存在是不够的，必须同时断言错误字段【不存在】，否则
+// 有人把 id 改回 toolCallId 时，正向断言依然全绿。
+//
+// 注意本文件跑的是假 ctx，装不下真 projection，所以这层只能查形状。
+// 真 fold 的验证要用 .probe-subagent 的 --patch + headless 探针。
+{
+  const call = buildMirrorToolCallBlock({ id: 'toolu_1', name: 'Bash', input: { command: 'echo hi' } })
+  check('⑦ tool-call 用 id/name（不是 toolCallId/toolName）',
+    call.id === 'toolu_1' && call.name === 'Bash'
+    && !('toolCallId' in call) && !('toolName' in call), JSON.stringify(call))
+  check('⑦ tool-call 的 arguments 是 JSON 字符串（不是对象 input）',
+    typeof call.arguments === 'string' && !('input' in call)
+    && JSON.parse(call.arguments).command === 'echo hi', typeof call.arguments)
+  check('⑦ 已序列化的 input 原样透传，不二次编码',
+    buildMirrorToolCallBlock({ id: 'x', name: 'y', input: '{"a":1}' }).arguments === '{"a":1}')
+  check('⑦ 缺 id 时自动补，不留空串',
+    typeof buildMirrorToolCallBlock({ name: 'y' }).id === 'string'
+    && buildMirrorToolCallBlock({ name: 'y' }).id.length > 0)
+
+  const res = buildMirrorToolResultBlock({ callId: 'toolu_1', text: 'hi' })
+  check('⑦ tool-result 反过来用 toolCallId（与 tool-call 命名不一致）',
+    res.toolCallId === 'toolu_1' && !('id' in res), JSON.stringify(res))
+
+  const [uType, uData, uOpts] = buildMirrorUserEvent({ text: '任务', senderSessionId: 'session-p' })
+  check('⑦ user/message 的 id 在 data 顶层', uType === 'user/message'
+    && typeof uData.id === 'string' && uData.id.length > 0)
+  check('⑦ user/message 带 surfaceOp', uOpts?.surfaceOp === 'append')
+  check('⑦ 有 sender 时用 agent-message/relay',
+    uData.source.kind === 'agent-message' && uData.source.senderSessionId === 'session-p')
+  check('⑦ 无 sender 时降级为普通 user 来源',
+    buildMirrorUserEvent({ text: 'x' })[1].source.kind === 'user')
+
+  const [aType, aData, aOpts] = buildMirrorAssistantEvent({ content: [{ type: 'text', text: 'hi' }], model: 'opus' })
+  check('⑦ assistant/message 的 id 在 data.message（不在 data 顶层）',
+    aType === 'assistant/message' && typeof aData.message.id === 'string'
+    && aData.message.id.length > 0 && aData.id === undefined)
+  check('⑦ assistant/message 带 surfaceOp', aOpts?.surfaceOp === 'append')
+
+  const [tType, tData, tOpts] = buildMirrorToolResultEvent({ callId: 'toolu_1', text: 'hi' })
+  check('⑦ tool/result 的 id 也在 data.message',
+    tType === 'tool/result' && typeof tData.message.id === 'string' && tData.id === undefined)
+  check('⑦ tool/result 的 role 是 user（不是 tool）', tData.message.role === 'user')
+  check('⑦ tool/result 的 source 指回原调用', tData.message.source.kind === 'tool'
+    && tData.message.source.callId === 'toolu_1')
+  check('⑦ tool/result 带 surfaceOp', tOpts?.surfaceOp === 'append')
+
+  check('⑦ descriptor 版本与 mode', (() => {
+    const d = buildMirrorDescriptor({ provider: 'claude-code-task', label: 'L' })
+    return d.version === MIRROR_DESCRIPTOR_VERSION && d.mode === 'one-shot' && d.label === 'L'
+  })())
+  check('⑦ 子会话 meta 带 origin:subagent', (() => {
+    const m = buildMirrorChildMeta({ cwd: '/w', parentSession: 'session-p' })
+    return m.origin === 'subagent' && m.parentSession === 'session-p' && m.delegationDepth === 1
+  })())
+
+  // appendMirrorEvent 是「surfaceOp 漏不掉」的最后一环：三元组里带 opts 就必须
+  // 透传，不带就必须只传两个参数（非 surface 事件多传会被 append 拒绝）。
+  const seen = []
+  const fakeSession = { append: (...args) => { seen.push(args); return { seq: seen.length } } }
+  appendMirrorEvent(fakeSession, buildMirrorUserEvent({ text: 'x' }))
+  appendMirrorEvent(fakeSession, ['turn/start', { turn: 1 }, undefined])
+  check('⑦ appendMirrorEvent 透传 surface 事件的第三参数',
+    seen[0].length === 3 && seen[0][2].surfaceOp === 'append', JSON.stringify(seen[0]?.length))
+  check('⑦ appendMirrorEvent 对非 surface 事件只传两个参数',
+    seen[1].length === 2, JSON.stringify(seen[1]?.length))
+}
+
+// ── ⑧ 子代理镜像收集器 ─────────────────────────────────────────────────
+//
+// 收集器把 SDK 消息流折叠成 open/events/close 三种动作。它是纯闭包，所以这里
+// 能完整测；写盘的驱动只是把三种动作映射成 sessions.create / appendMirrorEvent
+// / sessionPersistence.append，风险都压在这一半。
+//
+// 重点覆盖边界：主流与子流靠 parent_tool_use_id 区分（null 是外层），
+// 非 Task 工具不得触发，未知父 id 不得触发，关闭后不得再接受，并发任务不得混。
+{
+  const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
+  const user = (parentId, content) => ({ type: 'user', parent_tool_use_id: parentId, message: { content } })
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+
+  {
+    const c = createMirrorCollector({ senderSessionId: 'session-parent', model: 'claude-opus-5' })
+    const opened = c.observe(assistant(null, [taskUse('task-1', {
+      description: '查依赖树', prompt: '请检查依赖', subagent_type: 'Explore',
+    })]))
+    check('⑧ Task 调用产出 open 动作', opened.length === 1 && opened[0].kind === 'open'
+      && opened[0].taskId === 'task-1')
+    check('⑧ label 取 description', opened[0].label === '查依赖树')
+    check('⑧ subagent_type 被带出', opened[0].subagentType === 'Explore')
+    check('⑧ open 的事件是 turn/start + user + step/start', (() => {
+      const types = opened[0].events.map(e => e[0])
+      return types.join(',') === 'turn/start,user/message,step/start'
+    })(), JSON.stringify(opened[0].events.map(e => e[0])))
+    check('⑧ 提示词进了 user/message', opened[0].events[1][1].content[0].text === '请检查依赖')
+    check('⑧ openTaskIds 反映未闭合任务', c.openTaskIds().join() === 'task-1')
+
+    // 子代理的思考 + 正文 + 工具调用
+    const acts = c.observe(assistant('task-1', [
+      { type: 'thinking', thinking: '先看 package.json' },
+      { type: 'text', text: '开始检查' },
+      { type: 'tool_use', id: 'call-1', name: 'Bash', input: { command: 'ls' } },
+    ]))
+    check('⑧ 子代理消息产出 events 动作', acts.length === 1 && acts[0].kind === 'events'
+      && acts[0].taskId === 'task-1')
+    const inner = acts[0].events[0][1].message.content
+    check('⑧ thinking 映射成 reasoning', inner[0].type === 'reasoning' && inner[0].text === '先看 package.json')
+    check('⑧ text 原样保留', inner[1].type === 'text' && inner[1].text === '开始检查')
+    check('⑧ 子代理的 tool_use 转成合规 tool-call 块',
+      inner[2].type === 'tool-call' && inner[2].id === 'call-1' && inner[2].name === 'Bash'
+      && typeof inner[2].arguments === 'string' && !('input' in inner[2]))
+
+    // 子代理的工具结果
+    const resActs = c.observe(user('task-1', [
+      { type: 'tool_result', tool_use_id: 'call-1', content: [{ type: 'text', text: 'a.js' }], is_error: false },
+    ]))
+    check('⑧ 子代理工具结果产出 tool/result',
+      resActs[0].events[0][0] === 'tool/result'
+      && resActs[0].events[0][1].message.source.callId === 'call-1')
+
+    // 空消息（例如只带 usage）不该产出无内容的行
+    check('⑧ 空内容的子代理消息不产出动作', c.observe(assistant('task-1', [])).length === 0)
+    check('⑧ redacted_thinking 被丢弃而非变成空块',
+      c.observe(assistant('task-1', [{ type: 'redacted_thinking', data: 'x' }])).length === 0)
+
+    // Task 结果回到主流 → close
+    const closed = c.observe(user(null, [
+      { type: 'tool_result', tool_use_id: 'task-1', content: [{ type: 'text', text: '完成' }], is_error: false },
+    ]))
+    check('⑧ Task 结果产出 close 动作', closed.length === 1 && closed[0].kind === 'close'
+      && closed[0].taskId === 'task-1')
+    check('⑧ close 的事件是 step/end + turn/end + title', (() => {
+      const types = closed[0].events.map(e => e[0])
+      return types.join(',') === 'step/end,turn/end,session/title'
+    })(), JSON.stringify(closed[0].events.map(e => e[0])))
+    check('⑧ 标题用 Task 的 description',
+      closed[0].events[2][1].title === '查依赖树')
+    check('⑧ 成功的 turn/end 是 completed',
+      closed[0].events[1][1].reason.kind === 'completed')
+    check('⑧ close 后 openTaskIds 清空', c.openTaskIds().length === 0)
+    check('⑧ close 后该 id 的子消息不再被接受',
+      c.observe(assistant('task-1', [{ type: 'text', text: '迟到' }])).length === 0)
+  }
+
+  // 非 Task 工具不得触发镜像
+  {
+    const c = createMirrorCollector({})
+    check('⑧ 非 Task 的 tool_use 不产出任何动作',
+      c.observe(assistant(null, [{ type: 'tool_use', id: 'b1', name: 'Bash', input: {} }])).length === 0
+      && c.openTaskIds().length === 0)
+  }
+
+  // 未知父 id 的子消息不得触发（防止把别的东西当成子代理）
+  {
+    const c = createMirrorCollector({})
+    check('⑧ 未知父 id 的消息被忽略',
+      c.observe(assistant('never-opened', [{ type: 'text', text: 'x' }])).length === 0)
+  }
+
+  // 并发任务必须分组，不能混
+  {
+    const c = createMirrorCollector({})
+    c.observe(assistant(null, [
+      taskUse('t-a', { description: 'A', prompt: 'pa' }),
+      taskUse('t-b', { description: 'B', prompt: 'pb' }),
+    ]))
+    check('⑧ 一条消息里的两个 Task 各自 open', c.openTaskIds().join() === 't-a,t-b')
+    const a = c.observe(assistant('t-a', [{ type: 'text', text: 'from A' }]))
+    const b = c.observe(assistant('t-b', [{ type: 'text', text: 'from B' }]))
+    check('⑧ 并发子流按 taskId 分组', a[0].taskId === 't-a' && b[0].taskId === 't-b'
+      && a[0].events[0][1].message.content[0].text === 'from A'
+      && b[0].events[0][1].message.content[0].text === 'from B')
+    const closedA = c.observe(user(null, [{ type: 'tool_result', tool_use_id: 't-a', content: [], is_error: true }]))
+    check('⑧ 失败的 turn/end 是 error', closedA[0].events[1][1].reason.kind === 'error')
+    check('⑧ 关掉一个不影响另一个', c.openTaskIds().join() === 't-b')
+  }
 }
 
 console.log(`\n${fail === 0 ? 'all checks passed' : fail + ' FAILED'} (${pass} passed)`)

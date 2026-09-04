@@ -388,6 +388,296 @@ export function buildToolActivityBlock(use, output, isError) {
   }
 }
 
+// ─── Subagent mirroring: DSH session-event builders ─────────────────────
+//
+// WHY THESE EXIST AS BUILDERS rather than object literals at the call sites.
+//
+// Mirroring an inner Claude Code Task subagent into a DSH child session means
+// hand-writing DSH session events. That storage format has at least THREE
+// validators of increasing strictness, and the weak ones do not protect you:
+//
+//   persistence.inspect()                        reads a malformed log happily
+//   sessions.prepare(seedSource:'persistence')   restore validation — also passes
+//   projection fold                              the only one that rejects
+//
+// A shape mistake therefore survives `Session.append`, survives the durable
+// write, survives a same-process read back, and finally surfaces as
+// "会话记录损坏" on the user's screen with the real cause swallowed
+// (`listChildren` only reports corrupt/unavailable/unsupported). Three shapes
+// were measured wrong on the first attempt, each caught only at the fold:
+//
+//   1. `assistant/message` and `tool/result` need `data.message.id`; a
+//      `user/message` needs `id` at the DATA top level instead
+//      (core/session assertMessageEventShape).
+//   2. A `tool-call` block is `{id, name, arguments}` — NOT
+//      {toolCallId, toolName, input} — and `arguments` is a JSON STRING.
+//      The `.length` read on the missing `arguments` is what threw.
+//      A `tool-result` block, confusingly, does use `toolCallId`.
+//   3. The three surface event types must carry a third append argument,
+//      `{surfaceOp:'append'}`; it is a conditional type parameter, so nothing
+//      at runtime reminds you.
+//
+// So these builders return a ready-to-apply `[type, data, opts]` TRIPLE and
+// default a missing id to a fresh uuid: the aim is to make the invalid state
+// unrepresentable at the call site, not merely detectable afterwards. Shapes
+// below were transcribed from real session logs, not inferred from types.
+
+/** `SUBAGENT_DESCRIPTOR_VERSION` in @deepseek-ai/dsh-subagent. */
+export const MIRROR_DESCRIPTOR_VERSION = 3
+/** The mandatory third `append` argument for every surface event type. */
+const MIRROR_SURFACE = Object.freeze({ surfaceOp: 'append' })
+
+/** Apply one built triple, so a call site cannot drop the surface argument. */
+export function appendMirrorEvent(session, triple) {
+  const [type, data, opts] = triple
+  return opts === undefined ? session.append(type, data) : session.append(type, data, opts)
+}
+
+/**
+ * Child-session `meta`, matching what `childSessionMeta()` produces for real
+ * subagents. `origin` is what the sidebar filters on and what the header
+ * catalog keys off; `parentSession` is what the lineage walk follows.
+ */
+export function buildMirrorChildMeta({ cwd, parentSession, delegationDepth = 1 }) {
+  return { cwd, parentSession, origin: 'subagent', delegationDepth }
+}
+
+/**
+ * The identity record without which a child is not a subagent at all: the
+ * registered `subagent` projection is the SOLE mode/label classifier, so a
+ * child carrying only `origin`/`parentSession` never reaches the catalog.
+ */
+export function buildMirrorDescriptor({ provider, label }) {
+  return { version: MIRROR_DESCRIPTOR_VERSION, mode: 'one-shot', provider, label }
+}
+
+/** SDK `tool_use` → DSH `tool-call` block. Trap 2 lives entirely here. */
+export function buildMirrorToolCallBlock(use) {
+  const input = use?.input
+  return {
+    type: 'tool-call',
+    id: String(use?.id ?? randomUUID()),
+    name: String(use?.name ?? 'tool'),
+    // Already-serialized input passes through; anything else is stringified,
+    // because a non-string here is the exact `.length` crash.
+    arguments: typeof input === 'string' ? input : JSON.stringify(input ?? {}),
+  }
+}
+
+/** Tool output → DSH `tool-result` block. Note `toolCallId`, unlike tool-call. */
+export function buildMirrorToolResultBlock({ callId, text, isError = false }) {
+  return {
+    type: 'tool-result',
+    toolCallId: String(callId ?? ''),
+    content: [{ type: 'text', text: typeof text === 'string' ? text : '' }],
+    isError: isError === true,
+  }
+}
+
+/** The Task prompt the parent handed down, as the child's opening user turn. */
+export function buildMirrorUserEvent({ text, id, senderSessionId }) {
+  return ['user/message', {
+    content: [{ type: 'text', text: typeof text === 'string' ? text : '' }],
+    // `agent-message`/`relay` is the registered source for one agent addressing
+    // another; without a sender it degrades to a plain user prompt.
+    source: senderSessionId === undefined
+      ? { kind: 'user' }
+      : { kind: 'agent-message', form: 'relay', senderSessionId },
+    role: 'user',
+    // Trap 1a: `user/message` carries its id at the DATA top level.
+    id: id ?? randomUUID(),
+  }, MIRROR_SURFACE]
+}
+
+/** One mirrored assistant message (reasoning / text / tool-call blocks). */
+export function buildMirrorAssistantEvent({ turn = 1, step = 1, content, id, provider = 'claude-code', model }) {
+  return ['assistant/message', {
+    turn,
+    step,
+    message: {
+      // Trap 1b: here the id belongs on `data.message`, not on `data`.
+      id: id ?? randomUUID(),
+      role: 'assistant',
+      source: { kind: 'model', provider, ...model === undefined ? {} : { model } },
+      content: Array.isArray(content) ? content : [],
+    },
+  }, MIRROR_SURFACE]
+}
+
+/** One mirrored tool result. `role` is `'user'` here, not `'tool'`. */
+export function buildMirrorToolResultEvent({ turn = 1, step = 1, callId, text, isError = false, id }) {
+  return ['tool/result', {
+    turn,
+    step,
+    message: {
+      id: id ?? randomUUID(),
+      // Counter-intuitive but measured: a tool result rides as a USER-role
+      // message whose source names the originating call.
+      role: 'user',
+      source: { kind: 'tool', callId: String(callId ?? '') },
+      content: [buildMirrorToolResultBlock({ callId, text, isError })],
+    },
+  }, MIRROR_SURFACE]
+}
+
+/** The inner tool whose calls spawn a Claude Code subagent. */
+const MIRROR_TASK_TOOL = 'Task'
+
+/**
+ * Clamp for one mirrored tool result. The child session is a transcript, not a
+ * replay corpus, so this is generous compared with REPLAY_STATUS_MAX_CHARS —
+ * but still bounded: a runaway build log would otherwise be persisted twice
+ * (once in the parent's activity card, once here).
+ */
+const MIRROR_RESULT_MAX_CHARS = 8000
+
+/** SDK content block → one DSH assistant content block, or undefined to drop. */
+function mirrorContentBlock(block) {
+  const type = block?.type
+  if (type === 'text') return { type: 'text', text: String(block.text ?? '') }
+  // The SDK names the field after the block: `thinking.thinking`. DSH calls the
+  // same thing `reasoning.text`.
+  if (type === 'thinking') return { type: 'reasoning', text: String(block.thinking ?? '') }
+  if (type === 'redacted_thinking') return undefined
+  if (type === 'tool_use') return buildMirrorToolCallBlock(block)
+  return undefined
+}
+
+/**
+ * Fold an SDK message stream into mirror ACTIONS for inner `Task` subagents.
+ *
+ * WHY A COLLECTOR AND NOT A ONE-SHOT CONVERTER: the live path has to write a
+ * child session as its subagent runs, so the same logic must work
+ * incrementally. Keeping it a pure closure — no ctx, no session, no I/O — is
+ * what lets the whole risky half be tested against a fake ctx while the driver
+ * that touches `~/.dsh` stays a three-line mapping.
+ *
+ * The stream carries parent and child interleaved, distinguished only by
+ * `parent_tool_use_id`: `null` is the outer session, a string is the child of
+ * that tool call. Today the plugin DISCARDS every non-null one (four filters in
+ * translateSdkMessages) because sub-agent messages must not be sampled for
+ * context occupancy — this collector is the consumer that discarding starved.
+ *
+ * Actions, in the order a driver must apply them:
+ *   `open`   — a Task call appeared; create the child session, then append.
+ *   `events` — child activity; append.
+ *   `close`  — the Task's result arrived; append, then persist and forget.
+ *
+ * SIMPLIFICATION, deliberate: every child event is folded into turn 1 / step 1.
+ * A faithful mirror would open a step per inner model call, but single-step is
+ * the shape that was actually measured through a real projection fold; a
+ * multi-step log is unverified, and this format punishes unverified guesses by
+ * failing only at cold read. Revisit with a fold test, not by reasoning.
+ */
+export function createMirrorCollector({ provider = 'claude-code-task', model, senderSessionId } = {}) {
+  /** taskId → the child's durable label, so `close` can title the session. */
+  const open = new Map()
+
+  const blocksOf = (message) => {
+    const content = message?.message?.content
+    return Array.isArray(content) ? content : []
+  }
+
+  return {
+    /** Task ids still awaiting a result — a driver closes these on abort. */
+    openTaskIds: () => [...open.keys()],
+
+    /**
+     * @param message - one raw SDK stream message.
+     * @returns the actions this message produced, possibly empty.
+     */
+    observe(message) {
+      const parentId = message?.parent_tool_use_id
+      const actions = []
+
+      // ── outer session ────────────────────────────────────────────────
+      if (parentId === null || parentId === undefined) {
+        if (message?.type === 'assistant') {
+          for (const block of blocksOf(message)) {
+            if (block?.type !== 'tool_use' || block?.name !== MIRROR_TASK_TOOL) continue
+            if (typeof block.id !== 'string') continue
+            const input = block.input ?? {}
+            // `description` is the short human label Claude Code sends with
+            // every Task; `subagent_type` names the persona it picked.
+            const label = String(input.description ?? input.subagent_type ?? MIRROR_TASK_TOOL)
+            open.set(block.id, label)
+            actions.push({
+              kind: 'open',
+              taskId: block.id,
+              label,
+              subagentType: input.subagent_type === undefined ? undefined : String(input.subagent_type),
+              events: [
+                ['turn/start', { turn: 1 }, undefined],
+                buildMirrorUserEvent({ text: String(input.prompt ?? ''), senderSessionId }),
+                ['step/start', { turn: 1, step: 1 }, undefined],
+              ],
+            })
+          }
+          return actions
+        }
+        if (message?.type === 'user') {
+          for (const block of blocksOf(message)) {
+            if (block?.type !== 'tool_result') continue
+            const taskId = block.tool_use_id
+            const label = open.get(taskId)
+            if (label === undefined) continue
+            open.delete(taskId)
+            actions.push({
+              kind: 'close',
+              taskId,
+              isError: block.is_error === true,
+              events: [
+                ['step/end', { turn: 1, step: 1 }, undefined],
+                ['turn/end', {
+                  turn: 1,
+                  reason: { kind: block.is_error === true ? 'error' : 'completed' },
+                }, undefined],
+                // Without a title the child shows as an unnamed row; the Task
+                // description is the only label the stream offers.
+                ['session/title', {
+                  title: label,
+                  messageSeqs: [],
+                  source: { kind: 'fallback' },
+                }, undefined],
+              ],
+            })
+          }
+        }
+        return actions
+      }
+
+      // ── child of a known Task ────────────────────────────────────────
+      if (!open.has(parentId)) return actions
+
+      if (message?.type === 'assistant') {
+        const content = blocksOf(message).map(mirrorContentBlock).filter(b => b !== undefined)
+        // An empty (e.g. usage-only) message would add a contentless row.
+        if (content.length === 0) return actions
+        actions.push({
+          kind: 'events',
+          taskId: parentId,
+          events: [buildMirrorAssistantEvent({ content, provider: 'claude-code', model })],
+        })
+        return actions
+      }
+
+      if (message?.type === 'user') {
+        const events = []
+        for (const block of blocksOf(message)) {
+          if (block?.type !== 'tool_result') continue
+          events.push(buildMirrorToolResultEvent({
+            callId: block.tool_use_id,
+            text: resultText(block.content, MIRROR_RESULT_MAX_CHARS),
+            isError: block.is_error === true,
+          }))
+        }
+        if (events.length > 0) actions.push({ kind: 'events', taskId: parentId, events })
+      }
+      return actions
+    },
+  }
+}
+
 /** SDK options for the configured mode; bypass carries its mandatory flag. */
 export function buildPermissionOptions(mode = DEFAULTS.permissionMode) {
   const resolved = resolvePermissionMode(mode)
