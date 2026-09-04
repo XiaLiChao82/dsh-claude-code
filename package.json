@@ -1,0 +1,41 @@
+{
+  "name": "dsh-llm-claude-code",
+  "version": "0.30.0",
+  "description": "DSH host plugin: route a DSH conversation to a real Claude Code session through the Agent SDK. Bridges DSH's bash/read/write/edit/todo_write tools into the inner session (switching the native equivalents off), renders every inner tool call as a live card, maps DSH's read-only and plan modes onto the inner permission mode, and routes /compact and /goal to whichever side owns them.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "main.v20.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "checkup.mjs",
+    "verify-compact.mjs",
+    "dsh-patches/tool-activity/apply.mjs",
+    "dsh-patches/tool-activity/verify.mjs"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.220",
+    "zod": "^4.5.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}

@@ -51,9 +51,12 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 
 | 文件 | 作用 |
 | --- | --- |
+| `package.json` | 组合包清单：`dsh.bundle.patch`、入口、依赖 |
+| `index.js` | 包入口，一行转发到 `main.v20.mjs`（发布用的固定入口） |
+| `cordis.patch.yml` | 自带配置层：注册插件行 + 关掉 DSH 内置的 `/compact`、`/goal` |
 | `main.v20.mjs` | 全部实现都在这里，原地修改 |
-| `main.v29.mjs` | 只有一行 `export * from './main.v20.mjs'` |
-| `INSTALL.md` | 安装步骤、历次改动的来龙去脉、排障记录 |
+| `main.v29.mjs` | 只有一行 `export * from './main.v20.mjs'`，手工挂载开发时用，不随包发布 |
+| `INSTALL.md` | 历次改动的来龙去脉与排障记录（其中的手工安装步骤已被上面的组合包方式取代） |
 | `checkup.mjs` | 体检：直接读真实 DSH 目录，核对插件的假设还成不成立 |
 | `verify-compact.mjs` | 自检：用假环境跑一遍插件逻辑 |
 | `e2e-*.mjs` | 针对单项功能的端到端检查 |
@@ -66,13 +69,26 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 
 ## 安装
 
-完整步骤看 [INSTALL.md](INSTALL.md)。四步：
+本插件是标准**组合包**（bundle），按 DSH 官方约定安装
+（[docs/user/develop/basic/publish.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.zh.md)）：
 
 0. **先确认 DSH 版本**：`dsh --version`。不是 `0.1.2-rc.1` 就先看下面的
    「DSH 版本兼容」—— 版本对不上会直接启动失败。
-1. 把这个目录放到 `~/.dsh/profiles/web/plugins/llm-claude-code/`
-2. 在 `cordis.patch.yml` 里加一行指向 `main.v29.mjs`
-3. 重启 `dsh web`，刷新页面
+1. 装进 profile：
+
+   ```sh
+   dsh plugin --profile web add /path/to/llm-claude-code
+   ```
+
+2. 重启 `dsh web`，刷新页面。
+
+包自带 `cordis.patch.yml`，会自己注册插件行、并关掉 DSH 内置的 `/compact` 与
+`/goal`（本插件提供同名替代，注册两次会抛错）——**不需要手改任何全局配置**。
+卸载用 `dsh plugin --profile web remove dsh-llm-claude-code`，依赖和配置层一起摘掉。
+
+> **没打界面补丁也能正常用。** `toolActivityDisplay` 默认 `native`，不依赖补丁；
+> 只有显式设成 `card` 时才需要。补丁不在位时插件会自动回退到 `fold` 并在日志里
+> 说明原因，不会让轨迹面板抛 TypeError。补丁怎么打见下面「界面补丁」。
 
 > ⚠️ 改完代码**必须重启** `dsh web`。插件加载器只在文件名变化时才重新读代码，
 > 改内容它不管。
@@ -81,7 +97,7 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 
 ```bash
 node verify-compact.mjs   # 自检，164 项（放在 profile 目录下跑是 167 项）
-node checkup.mjs          # 体检，35 项（打了 rc.2 回退补丁后是 36 项）
+node checkup.mjs          # 体检，39 项（打了 rc.2 回退补丁后是 40 项）
 node checkup.mjs --live   # 额外探测 Claude Code 的输出格式，要真起一次会话，约一分钟
 ```
 
@@ -142,7 +158,7 @@ git checkout <该提交> && git apply compat/dsh-0.1.1-rc.2.patch
 （`dsh-llm` 那处补丁两个版本都要打，没变化。）
 
 前三处让插件在错误版本上**加载即崩**，第四处只让工具卡渲染不出来。
-体检项数也因此差 1：rc.2 是 36 项，rc.1 是 35 项。
+体检项数也因此差 1：rc.2 是 40 项，rc.1 是 39 项。
 
 功能上两个版本没有差别 —— 包括 `todo_write` 桥接，`dsh-tool-todo` 在
 0.1.1-rc.2 里就已经有了。

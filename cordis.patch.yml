@@ -1,0 +1,33 @@
+# dsh-llm-claude-code bundle patch
+#
+# `package.json` 的 `dsh.bundle.patch` 指向本文件，插件因此自注册进 profile，
+# 不需要手改 ~/.dsh/profiles/<name>/cordis.patch.yml。
+#
+# 层序（见 DSH docs/user/develop/basic/publish.zh.md）：
+#   dsh-base → dsh-web-app → …各 bundle 按加入顺序… → 本 bundle
+#   → profile 自己的 cordis.patch.yml → ~/.dsh/cordis.patch.yml → --patch
+# 本 bundle 排在 base/web-app 之后，所以下面两行的覆盖成立；反过来，用户仍可
+# 在自己 profile 的 patch 里再覆盖回去，无需改动本包。
+
+- insert:
+    - id: llm-claude-code
+      name: 'dsh-llm-claude-code'
+
+# 本插件自带 `/compact`：它把 claude-code-main 路由转给内层 Claude Code 会话的
+# 压缩，其余 provider 原样转发给 ctx.compaction。同名命令注册两次会抛错，所以
+# 关掉 DSH 自带的那一行。
+#
+# dsh-web-app 其实已经把这行关掉了（它的 cordis.patch.yml 里同样只写 id +
+# disabled），这里重述一次是为了让本包在没有 web-app 的 profile 里也成立——
+# 覆盖是幂等的。只写 disabled 不必重述 name：patch 替换的是 `config` 整体，
+# 而这两行都不带 config。
+- id: command-compact
+  disabled: true
+
+# 同理：本插件自带 `/goal`，把 claude-code-main 路由转给内层 Claude Code 的目标
+# 机制（DSH 的 update_goal 工具在内层不可调用，DSH 目标会每轮空烧却永不完成）。
+# 其余 provider 由 DSH 自己捕获的处理器服务，行为不变。
+#
+# 与 command-compact 不同，dsh-base 之后没有任何内置层关掉它，本行是唯一的禁用点。
+- id: command-goal
+  disabled: true

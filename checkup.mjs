@@ -19,6 +19,15 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** This bundle's package name, as `dsh plugin add` records it in the profile. */
+const PKG_NAME = 'dsh-llm-claude-code'
+
+/** Resolve a path inside THIS package, independent of the caller's cwd. */
+function ownPath(rel) {
+  return fileURLToPath(new URL(rel, import.meta.url))
+}
 
 const DEFAULT_ROOT =
   '/home/sumer/.volta/tools/image/packages/@deepseek-ai/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai'
@@ -183,6 +192,23 @@ check('semantics', '会话 id 传参未变', loopSrc !== undefined && loopSrc.in
   '/compact 和 /goal 找不到内层会话 → 一律报「先说句话」（v23/v24）',
   loopSrc === undefined ? '找不到 dsh-agent-loop' : '外层传的 sessionId 不再等于 session.id')
 
+// v30 bridges DSH's todo_write and switches the native TodoWrite off, so the
+// inner agent's plan lands in the panel the user already reads for every other
+// agent. The bridge picks the tool out of DSH's catalog BY NAME, and a missing
+// name fails silently in the worst possible direction: BRIDGED_TOOL_NAMES finds
+// nothing while REPLACED_NATIVE_TOOLS has already removed the native tool, so
+// the inner agent ends up with no todo tool at all. Searched tree-wide, like
+// the service names above, so a package rename alone cannot fail this.
+//
+// Deliberately NOT checked here: the `todo/write` event name, the `todos`
+// projection and the argument schema. Those are internal to dsh-tool-todo or
+// derived from its tool definition at runtime — the plugin hardcodes none of
+// them, so they are DSH's business to keep consistent, not assumptions to guard.
+const todoToolHits = grepFiles('name: "todo_write"')
+check('semantics', 'DSH 仍注册 todo_write 工具', todoToolHits.length > 0,
+  '桥接按名字挑不到工具，而内层原生 TodoWrite 已被关掉 → 内层一个 todo 工具都没有，计划面板全程空白（v30）',
+  todoToolHits.length === 0 ? '整个 DSH 树里搜不到这个工具名 — BRIDGED_TOOL_NAMES 要跟着改' : undefined)
+
 // ---------------------------------------------------------------- ui patches
 // These four live INSIDE the DSH install, so an upgrade always wipes them.
 heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
@@ -204,18 +230,50 @@ for (const [rel, impact] of UI_TARGETS) {
 }
 
 // ---------------------------------------------------------------- install
-heading('安装状态')
+// v30 起本插件是正规组合包（见 DSH docs/user/develop/basic/publish.zh.md）：
+// `dsh plugin --profile web add <本目录>` 装进 profile，包自带的
+// cordis.patch.yml 负责自注册。所以这些检查校验的是 BUNDLE 安装是否成立，
+// 不再检查旧的手工痕迹（往 plugins/ 拷文件 + 手改 profile 的 patch.yml）。
+//
+// 注意分工：profile 侧只证明"装了"，包侧证明"装进去的东西是对的"。两者都读
+// 文件而不跑 `dsh --dump-config`，因为后者要在 profile 目录写 cordis.yml。
+heading('安装状态（组合包）')
 const PROFILE = join(process.env.HOME ?? '', '.dsh/profiles/web')
-const patchYml = readIf(join(PROFILE, 'cordis.patch.yml'))
-check('install', 'patch.yml 指向的插件文件存在', (() => {
-  if (patchYml === undefined) return false
-  const m = /llm-claude-code\/(main\.v\d+\.mjs)/.exec(patchYml)
-  return m !== null && existsSync(join(PROFILE, 'plugins/llm-claude-code', m[1]))
-})(), '插件根本没加载 — patch.yml 指向了不存在的文件')
-check('install', 'DSH 自带 /compact 仍处于禁用', patchYml !== undefined && /id:\s*command-compact[\s\S]{0,40}disabled:\s*true/.test(patchYml),
+
+function readJson(path) {
+  const raw = readIf(path)
+  if (raw === undefined) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
+const bundles = readJson(join(PROFILE, 'package.json'))?.dsh?.profile?.bundles
+check('install', `${PKG_NAME} 在 profile 的 bundles 列表里`, Array.isArray(bundles) && bundles.includes(PKG_NAME),
+  '插件根本没加载 — 跑 dsh plugin --profile web add <本目录>',
+  Array.isArray(bundles) ? `当前列表: ${bundles.join(', ')}` : '读不到 dsh.profile.bundles')
+
+// 自带 patch 是自注册的唯一来源：声明丢了，dsh plugin 会把它当普通依赖装，
+// 打一句警告然后不激活任何层——插件静默地不存在。
+const ownPkg = readJson(ownPath('package.json'))
+const patchRel = ownPkg?.dsh?.bundle?.patch
+check('install', 'package.json 声明了 dsh.bundle.patch', typeof patchRel === 'string',
+  '包不再是组合包 — dsh plugin 会当普通依赖装，不激活任何层')
+
+const ownPatch = typeof patchRel === 'string' ? readIf(ownPath(patchRel)) : undefined
+check('install', '自带 patch 注册了插件行', ownPatch !== undefined && /id:\s*llm-claude-code/.test(ownPatch),
+  '插件不会被挂进任何 profile')
+check('install', '自带 patch 关掉 DSH 的 /compact', ownPatch !== undefined && /id:\s*command-compact[\s\S]{0,40}disabled:\s*true/.test(ownPatch),
   '同名命令注册两次 → DSH 启动直接报错（v23）')
-check('install', 'DSH 自带 /goal 仍处于禁用', patchYml !== undefined && /id:\s*command-goal[\s\S]{0,40}disabled:\s*true/.test(patchYml),
+check('install', '自带 patch 关掉 DSH 的 /goal', ownPatch !== undefined && /id:\s*command-goal[\s\S]{0,40}disabled:\s*true/.test(ownPatch),
   '同名命令注册两次 → DSH 启动直接报错（v24）')
+
+// 旧的手工挂载若残留，会和自带 patch 插入同一个 id 两次。
+const profilePatch = readIf(join(PROFILE, 'cordis.patch.yml'))
+check('install', 'profile 里没有残留的手写挂载', profilePatch === undefined || !/plugins\/llm-claude-code/.test(profilePatch),
+  '同一个 id 被插入两次 — 删掉 profile cordis.patch.yml 里那段手写 insert')
 
 // ---------------------------------------------------------------- live
 // These assumptions belong to CLAUDE CODE, not DSH — a DSH upgrade cannot break

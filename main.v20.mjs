@@ -195,6 +195,9 @@
 //   - buildSystemAppend bridges the DSH tool catalog to native Claude tools.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
 import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
 import { ToolCallId, LlmError, createUserMessage, requestImageHandleText } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -297,6 +300,74 @@ export function resolvePermissionMode(value) {
 }
 
 export const TOOL_ACTIVITY_DISPLAYS = ['native', 'fold', 'card']
+
+/**
+ * Whether the tool-activity UI patch is present in the DSH install.
+ *
+ * `card` mode emits a custom content block that only a PATCHED DSH renders;
+ * against an unpatched install the trajectory panel throws a TypeError. The
+ * patch lives inside DSH's own bundle files, so a published package cannot
+ * carry it and every DSH upgrade wipes it — see dsh-patches/tool-activity/.
+ *
+ * Three-valued on purpose. `'unknown'` (module not resolvable, exports map
+ * hides package.json, file unreadable) must NOT degrade anything: a wrong
+ * guess would silently take `card` away from a correctly patched install.
+ * Only a confident `false` degrades.
+ *
+ * Cached: `config()` re-runs on every read, and this touches the filesystem.
+ */
+let toolActivityPatchState
+
+export function toolActivityPatchPresent() {
+  if (toolActivityPatchState !== undefined) return toolActivityPatchState
+  try {
+    const require = createRequire(import.meta.url)
+    // The UI packages are INTERNAL to the DSH install: they sit in dsh's own
+    // node_modules, not in the profile-level `@deepseek-ai` directory a plugin
+    // resolves through, so requesting one by name always fails. Anchor on a
+    // package this plugin already imports at the top of the file, then walk up
+    // to the shared `@deepseek-ai` root (the same ROOT checkup.mjs scans).
+    const anchor = require.resolve('@deepseek-ai/dsh-llm/package.json')
+    const root = join(anchor, '..', '..')
+    const source = readFileSync(join(root, 'dsh-client-ui-trajectory/lib/client.js'), 'utf8')
+    toolActivityPatchState = source.includes('tool-activity')
+  } catch {
+    toolActivityPatchState = 'unknown'
+  }
+  return toolActivityPatchState
+}
+
+/** Reset the cached probe. Tests only. */
+export function resetToolActivityPatchProbe() {
+  toolActivityPatchState = undefined
+}
+
+/**
+ * Fall back to `fold` when `card` was asked for but the UI patch is absent.
+ *
+ * `fold` is the closest survivor: it is the other real-time projection and
+ * needs no patch. Warns once — this is a deployment fact, not a per-turn one,
+ * and repeating it every turn would be noise.
+ * @param display - already normalised display mode.
+ * @param logger - optional ctx.logger.
+ * @param present - probe result; injectable so the degrade branch is testable
+ *   on a machine where the patch IS applied.
+ * @returns the display mode to actually use.
+ */
+let toolActivityDegradeWarned = false
+
+export function degradeToolActivityDisplay(display, logger, present = toolActivityPatchPresent()) {
+  if (display !== 'card') return display
+  if (present !== false) return display
+  if (!toolActivityDegradeWarned) {
+    toolActivityDegradeWarned = true
+    logger?.warn?.(
+      'toolActivityDisplay=card 需要 DSH 界面补丁，当前安装未打补丁（轨迹面板会抛 TypeError），'
+      + '已自动回退到 fold。要启用卡片：node dsh-patches/tool-activity/apply.mjs，然后重启 dsh web。',
+    )
+  }
+  return 'fold'
+}
 
 /** Clamp a configured activity display; unknown → native (ordered, not executed). */
 export function resolveToolActivityDisplay(value) {
@@ -1532,7 +1603,12 @@ export function apply(ctx, rawConfig = {}) {
     return {
       ...merged,
       permissionMode: resolvePermissionMode(merged.permissionMode),
-      toolActivityDisplay: resolveToolActivityDisplay(merged.toolActivityDisplay),
+      // Degrade AFTER normalising: `card` is an explicit opt-in, and an
+      // unpatched DSH would crash its trajectory panel on the custom block.
+      toolActivityDisplay: degradeToolActivityDisplay(
+        resolveToolActivityDisplay(merged.toolActivityDisplay),
+        ctx.logger,
+      ),
     }
   }
   const logger = ctx.logger
