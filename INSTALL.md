@@ -1,5 +1,10 @@
 # llm-claude-code v29 安装说明
 
+> ⚠️ **先看 DSH 版本。** 本文与主线代码适配 **DSH 0.1.2-rc.1**。
+> `0.1.1-rc.2` 与之**不兼容**，插件会加载即崩 —— 那个版本要先打回退补丁：
+> `git apply compat/dsh-0.1.1-rc.2.patch`（可逆，`-R` 撤销）。
+> 差异明细见 README 的「DSH 版本兼容」一节。
+
 patch.yml 安装后应指向 **main.v29.mjs**（实现仍在 `main.v20.mjs`，
 换文件名是为了让 cordis-plugin-loader 重新 import）。本部署的组合热重载
 处于禁用状态，**改完必须重启 `dsh web` 并刷新 `http://127.0.0.1:3080`**。
@@ -63,7 +68,17 @@ node dsh-patches/tool-activity/apply.mjs  # 界面补丁被覆盖时重打
 `node checkup.mjs --live` 才会探测 Claude Code 那一列（要真起一次内层会话，约一分钟）。
 不加 `--live` 只跑 DSH 那一列，秒级。
 
-基线：DSH `0.1.1-rc.2` + Claude Code `2.1.259`，43 项全通过。
+当前基线：DSH `0.1.2-rc.1` + Claude Code `2.1.260` + Agent SDK `0.3.220`，
+`checkup.mjs` **35 项**全通过。
+
+旧基线（打了 `compat/dsh-0.1.1-rc.2.patch` 之后适用）：DSH `0.1.1-rc.2` +
+Claude Code `2.1.259`，`checkup.mjs` **36 项**。
+
+两版项数差 1，是因为 rc.1 删掉了 `dsh-client-runtime` 包，界面补丁从
+「runtime + conversation 两处」变成「chat 一处」，体检项跟着合并。
+
+把 rc.2 版的 `checkup.mjs` 放到 0.1.2-rc.1 的机器上跑，会准确报出 3 项未通过 ——
+这本身就是版本装错的自检信号。
 
 ## v24：DSH 与 Claude Code 双方都有的命令/状态，按路由分流
 

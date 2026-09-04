@@ -66,8 +66,10 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 
 ## 安装
 
-完整步骤看 [INSTALL.md](INSTALL.md)。三句话版本：
+完整步骤看 [INSTALL.md](INSTALL.md)。四步：
 
+0. **先确认 DSH 版本**：`dsh --version`。不是 `0.1.2-rc.1` 就先看下面的
+   「DSH 版本兼容」—— 版本对不上会直接启动失败。
 1. 把这个目录放到 `~/.dsh/profiles/web/plugins/llm-claude-code/`
 2. 在 `cordis.patch.yml` 里加一行指向 `main.v29.mjs`
 3. 重启 `dsh web`，刷新页面
@@ -79,7 +81,7 @@ DSH 和 Claude Code 都是「会用工具的助手」。硬凑在一起，两边
 
 ```bash
 node verify-compact.mjs   # 自检，164 项（放在 profile 目录下跑是 167 项）
-node checkup.mjs          # 体检，35 项
+node checkup.mjs          # 体检，35 项（打了 rc.2 回退补丁后是 36 项）
 node checkup.mjs --live   # 额外探测 Claude Code 的输出格式，要真起一次会话，约一分钟
 ```
 
@@ -93,7 +95,12 @@ checkup.mjs          读真实目录    查「插件对 DSH 的理解还准不�
 DSH 改了名字或公式之后，前者照样全绿 —— 因为假环境仍按老名字应答。
 只有后者能发现。
 
-## 已验证的版本组合
+## DSH 版本兼容
+
+> ⚠️ **DSH `0.1.1-rc.2` 和 `0.1.2-rc.1` 互不兼容，代码只能二选一。**
+> 装错版本不是「功能少几个」，而是插件加载直接抛异常。
+
+主线（`main` 分支）适配 **0.1.2-rc.1**。已验证的组合：
 
 | 组件 | 版本 |
 | --- | --- |
@@ -101,6 +108,44 @@ DSH 改了名字或公式之后，前者照样全绿 —— 因为假环境仍�
 | Claude Code | 2.1.260 |
 | Claude Agent SDK | 0.3.220 |
 | Node.js | 24.15.0 |
+
+### 用 0.1.1-rc.2 的话，先打回退补丁
+
+```bash
+dsh --version                              # 先确认，是 0.1.1-rc.2 才需要打
+
+git apply compat/dsh-0.1.1-rc.2.patch      # 回退到 0.1.1-rc.2
+git apply -R compat/dsh-0.1.1-rc.2.patch   # 撤销回退，回到 0.1.2-rc.1
+```
+
+打完再按上面的「安装」走。补丁是可逆的，升级 DSH 之后用 `-R` 撤销即可，
+不需要重新拉仓库。
+
+如果 `git apply` 报冲突（说明主线已经往前走了），退回到这个补丁对应的提交再打：
+
+```bash
+git log --oneline -- compat/dsh-0.1.1-rc.2.patch   # 找到补丁最后一次更新的提交
+git checkout <该提交> && git apply compat/dsh-0.1.1-rc.2.patch
+```
+
+### 两个版本差在哪
+
+补丁覆盖 4 个文件，差异来自 DSH 上游的 4 处变更：
+
+| 变更 | 0.1.1-rc.2 | 0.1.2-rc.1 |
+| --- | --- | --- |
+| 工具调用 ID 类型 | `CallId` | `ToolCallId` |
+| 配置项注册 | `installSettingsSection()` + `settingsNamespace()` | `ctx.inject(['settings'])` → `settings.installSection()` |
+| 权限预设查询入参 | `permissionPresets.current(events)` | `permissionPresets.current(session)` |
+| 界面补丁的目标包 | `dsh-client-runtime`、`dsh-client-ui-conversation`、`dsh-client-ui-trajectory` 三处 | `dsh-client-runtime` 被上游删除，分类器内联进各消费者 bundle；卡片从 conversation 搬到 `dsh-client-ui-chat`。变成 `dsh-client-ui-chat` + `dsh-client-ui-trajectory` 两处 |
+
+（`dsh-llm` 那处补丁两个版本都要打，没变化。）
+
+前三处让插件在错误版本上**加载即崩**，第四处只让工具卡渲染不出来。
+体检项数也因此差 1：rc.2 是 36 项，rc.1 是 35 项。
+
+功能上两个版本没有差别 —— 包括 `todo_write` 桥接，`dsh-tool-todo` 在
+0.1.1-rc.2 里就已经有了。
 
 ## 已知的坑
 

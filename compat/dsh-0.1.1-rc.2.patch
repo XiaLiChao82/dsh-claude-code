@@ -1,0 +1,330 @@
+# 回退补丁：把本仓库代码改回适配 DSH 0.1.1-rc.2
+#
+# 仓库主线适配的是 DSH 0.1.2-rc.1。两个版本互不兼容，代码只能二选一。
+# 如果你的 DSH 是 0.1.1-rc.2，先打这个补丁再安装。
+#
+#   git apply compat/dsh-0.1.1-rc.2.patch      # 回退到 0.1.1-rc.2
+#   git apply -R compat/dsh-0.1.1-rc.2.patch   # 撤销回退，回到 0.1.2-rc.1
+#
+# 影响 4 个文件：
+#   main.v20.mjs                          5 处 API 差异
+#   checkup.mjs                           2 处（体检项跟着改）
+#   dsh-patches/tool-activity/apply.mjs   界面补丁目标包不同
+#   dsh-patches/tool-activity/verify.mjs  同上
+#
+# 详细说明见 README.md 的「DSH 版本兼容」一节。
+diff --git a/checkup.mjs b/checkup.mjs
+index 1739092..b05a399 100644
+--- a/checkup.mjs
++++ b/checkup.mjs
+@@ -114,7 +114,7 @@ check('methods', 'planMode.get(agent) 存在', planSrc !== undefined && planSrc.
+   '计划模式读不到状态 → 静默退化成建议（v24）')
+ 
+ const presetSrc = serviceSource('permissionPresets')
+-check('methods', 'permissionPresets.current(session) 存在', presetSrc !== undefined && presetSrc.includes('current(session) {'),
++check('methods', 'permissionPresets.current(events) 存在', presetSrc !== undefined && presetSrc.includes('current(events) {'),
+   '只读预设读不出来 → 内层照样改文件（v24）')
+ 
+ const goalSrc = serviceSource('goals')
+@@ -187,11 +187,9 @@ check('semantics', '会话 id 传参未变', loopSrc !== undefined && loopSrc.in
+ // These four live INSIDE the DSH install, so an upgrade always wipes them.
+ heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
+ const MARKER = 'tool-activity'
+-// 0.1.2-rc.1 起 dsh-client-runtime 包被上游删除（be531688f3），分类器被内联进
+-// 每个消费者 bundle：chat 一份、trajectory 一份，两份都得打；卡片也从
+-// dsh-client-ui-conversation 搬到了 dsh-client-ui-chat。
+ const UI_TARGETS = [
+-  ['dsh-client-ui-chat/lib/client.js', '工具卡退回「未知内容块」/ 不渲染'],
++  ['dsh-client-runtime/lib/client.js', '工具卡退回「未知内容块」'],
++  ['dsh-client-ui-conversation/lib/client.js', '工具卡不渲染'],
+   ['dsh-llm/lib/index.js', '中断后已完成的工具卡丢失'],
+   ['dsh-client-ui-trajectory/lib/client.js', '轨迹面板崩溃（TypeError）'],
+ ]
+diff --git a/dsh-patches/tool-activity/apply.mjs b/dsh-patches/tool-activity/apply.mjs
+index 82f490b..30f9f77 100644
+--- a/dsh-patches/tool-activity/apply.mjs
++++ b/dsh-patches/tool-activity/apply.mjs
+@@ -6,13 +6,10 @@
+ // classifies it as `kind: "other"` and the transcript renders the generic
+ // "unknown content block" JSON box. Three files must agree:
+ //
+-//   1. dsh-client-ui-chat/lib/client.js AND dsh-client-ui-trajectory/lib/client.js
++//   1. dsh-client-runtime/lib/client.js
+ //      `toAssistantBlock` / `emptyAssistantBlock` must classify the wire block
+ //      as `kind: "tool-activity"`. WITHOUT THIS the UI case below is dead code.
+-//      As of 0.1.2-rc.1 the dsh-client-runtime package is GONE (upstream
+-//      be531688f3) and each consumer bundle inlines its own copy of this
+-//      classifier — hence the same edit twice, once per bundle.
+-//   2. dsh-client-ui-chat/lib/client.js (was dsh-client-ui-conversation)
++//   2. dsh-client-ui-conversation/lib/client.js
+ //      `AssistantMarkdown` grows one case rendering a native-looking
+ //      DisclosureRow card (same primitive as Think and the native tool rows).
+ //   3. dsh-llm/lib/index.js
+@@ -112,11 +109,8 @@ const CARD_CSS = [
+   '.dsh-ta-terminal{--dsl-terminal-font:var(--dsw-font-markdown-code-block-small);--dsl-terminal-line-height:18px;--dsl-terminal-output-max-height:224px;border:1px solid var(--dsw-alias-border-l1)}',
+ ].join('')
+ 
+-// Anchored on the ONE unsuffixed `const css = "` in the bundle rather than a
+-// hashed class name: the CSS-module hash (`.Sxvs8a_root`) is regenerated on
+-// every build, so the old anchor broke on each DSH upgrade for no reason.
+-const CARD_CSS_ANCHOR = 'const css = "'
+-const CARD_CSS_PATCH = 'const css = "' + CARD_CSS
++const CARD_CSS_ANCHOR = 'const css$2 = ".Sxvs8a_root{'
++const CARD_CSS_PATCH = 'const css$2 = "' + CARD_CSS + '.Sxvs8a_root{'
+ 
+ const CARD_COMPONENT_ANCHOR =
+   'const AssistantMarkdown = (0, react.memo)(function AssistantMarkdown({'
+@@ -199,53 +193,8 @@ const CARD_COMPONENT = block(2, [
+   T + T + 'known: !isError',
+   T + '};',
+   '}',
+-  // 0.1.2-rc.1 (upstream 3c10f5d2d3, "route UI copy through locale") made
+-  // `labels` REQUIRED on all three primitives and dropped their internal
+-  // DEFAULT_LABELS merge (`const copy = labels`). Passing undefined — or a
+-  // one-field Partial, which is what this patch used to do — now throws inside
+-  // the primitive the moment the card is expanded, taking the whole assistant
+-  // message tree down with it. So every label set below is COMPLETE, with the
+-  // copy lifted verbatim from the shipped zh dictionary.
+-  '/** Full zh label set for the native TerminalBlock (copy: locale zh). */',
+-  'const TOOL_ACTIVITY_TERMINAL_LABELS = {',
+-  T + 'signal: (signal) => `信号 ${signal}`,',
+-  T + 'exitCode: (code) => `退出码 ${code}`,',
+-  T + 'running: "运行中",',
+-  T + 'failed: "失败",',
+-  T + 'done: "已完成",',
+-  T + 'copy: "复制",',
+-  T + 'copied: "复制成功",',
+-  T + 'noOutput: "无输出",',
+-  T + 'collapseAria: "收起输出",',
+-  T + 'collapse: "收起",',
+-  T + 'expandAria: (n) => `展开其余 ${n} 行输出`,',
+-  T + 'expand: (n) => `… 其余 ${n} 行`',
+-  '};',
+   '/** Failure with no parsable exit code: say so, do not claim a number. */',
+-  'const TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS = {',
+-  T + '...TOOL_ACTIVITY_TERMINAL_LABELS,',
+-  T + 'exitCode: () => "执行失败"',
+-  '};',
+-  '/** Full zh label set for the native ReadBlock (copy: locale zh). */',
+-  'const TOOL_ACTIVITY_READ_LABELS = {',
+-  T + 'window: (shown, total) => `显示 ${shown} / ${total} 行`,',
+-  T + 'copy: "复制",',
+-  T + 'copied: "复制成功",',
+-  T + 'collapseAria: "收起内容",',
+-  T + 'expandAria: (n) => `展开其余 ${n} 行`,',
+-  T + 'collapse: "收起",',
+-  T + 'expand: (n) => `… 其余 ${n} 行`',
+-  '};',
+-  '/** Full zh label set for the native DiffBlock (copy: locale zh). */',
+-  'const TOOL_ACTIVITY_DIFF_LABELS = {',
+-  T + 'copy: "复制",',
+-  T + 'copied: "复制成功",',
+-  T + 'collapseAria: "收起差异",',
+-  T + 'expandAria: (n) => `展开其余 ${n} 行差异`,',
+-  T + 'collapse: "收起",',
+-  T + 'expand: (n) => `… 其余 ${n} 行`,',
+-  T + 'files: (count) => `${count} 个文件`',
+-  '};',
++  'const TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS = { exitCode: () => "\\u6267\\u884c\\u5931\\u8d25" };',
+   '/** Tools whose result is a numbered file listing / a before-after pair. */',
+   'const TOOL_ACTIVITY_READ_TOOLS = { read: true };',
+   'const TOOL_ACTIVITY_DIFF_TOOLS = {',
+@@ -392,14 +341,12 @@ const CARD_COMPONENT = block(2, [
+   // what the native chat row passes to the two file cards.
+   T + T + T + T + 'children: diffs !== void 0 ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.DiffBlock, {',
+   T + T + T + T + T + 'diffs,',
+-  T + T + T + T + T + 'labels: TOOL_ACTIVITY_DIFF_LABELS,',
+   T + T + T + T + T + 'maxLines: 8',
+   T + T + T + T + '}) : readLines !== void 0 ? (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.ReadBlock, {',
+   T + T + T + T + T + 'label: toolActivityFilePath(activity),',
+   T + T + T + T + T + 'lines: readLines,',
+   T + T + T + T + T + 'totalLines: readLines.length,',
+   T + T + T + T + T + 'lang: toolActivityLang(toolActivityFilePath(activity)),',
+-  T + T + T + T + T + 'labels: TOOL_ACTIVITY_READ_LABELS,',
+   T + T + T + T + T + 'maxLines: 8',
+   // The native bash card IS this primitive: status dot, command lines, a hairline
+   // divider, then the output — no IN/OUT labels. Its built-in labels are already
+@@ -410,7 +357,7 @@ const CARD_COMPONENT = block(2, [
+   T + T + T + T + T + 'exitCode: exit.exitCode,',
+   T + T + T + T + T + 'running: false,',
+   T + T + T + T + T + 'maxLines: Infinity,',
+-  T + T + T + T + T + 'labels: exit.known ? TOOL_ACTIVITY_TERMINAL_LABELS : TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS,',
++  T + T + T + T + T + 'labels: exit.known ? void 0 : TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS,',
+   T + T + T + T + T + 'className: "dsh-ta-terminal"',
+   T + T + T + T + '})',
+   T + T + T + '})',
+@@ -490,16 +437,17 @@ const TRAJECTORY_TIMELINE_PATCH =
+ 
+ const TARGETS = [
+   {
+-    // 0.1.2-rc.1 deleted dsh-client-runtime (upstream be531688f3, "remove
+-    // Runtime") and inlined its block classifier into EACH consumer bundle.
+-    // Chat carries one copy and Trajectory carries another, so the classify
+-    // edits below are applied to BOTH — patching only one leaves that surface
+-    // rendering the generic "unknown content block" box.
+-    file: 'dsh-client-ui-chat/lib/client.js',
+-    why: 'classify the tool-activity wire block + render the activity card',
++    file: 'dsh-client-runtime/lib/client.js',
++    why: 'classify the tool-activity wire block',
+     edits: [
+       ['toAssistantBlock', RUNTIME_CLASSIFY_ANCHOR, RUNTIME_CLASSIFY_PATCH],
+       ['emptyAssistantBlock', RUNTIME_EMPTY_ANCHOR, RUNTIME_EMPTY_PATCH],
++    ],
++  },
++  {
++    file: 'dsh-client-ui-conversation/lib/client.js',
++    why: 'render the collapsible activity card',
++    edits: [
+       ['card css', CARD_CSS_ANCHOR, CARD_CSS_PATCH],
+       ['card component', CARD_COMPONENT_ANCHOR, CARD_COMPONENT + CARD_COMPONENT_ANCHOR],
+       ['AssistantMarkdown case', CARD_CASE_ANCHOR, CARD_CASE_PATCH],
+@@ -515,10 +463,8 @@ const TARGETS = [
+   },
+   {
+     file: 'dsh-client-ui-trajectory/lib/client.js',
+-    why: 'classify in this bundle\'s own copy, and stop the panel crashing on the new kind',
++    why: 'stop the Trajectory panel crashing on the new kind',
+     edits: [
+-      ['toAssistantBlock', RUNTIME_CLASSIFY_ANCHOR, RUNTIME_CLASSIFY_PATCH],
+-      ['emptyAssistantBlock', RUNTIME_EMPTY_ANCHOR, RUNTIME_EMPTY_PATCH],
+       ['assistantSourceBlock', TRAJECTORY_SOURCE_ANCHOR, TRAJECTORY_SOURCE_PATCH],
+       ['timelineBlock', TRAJECTORY_TIMELINE_ANCHOR, TRAJECTORY_TIMELINE_PATCH],
+     ],
+diff --git a/dsh-patches/tool-activity/verify.mjs b/dsh-patches/tool-activity/verify.mjs
+index 26dce25..016a477 100644
+--- a/dsh-patches/tool-activity/verify.mjs
++++ b/dsh-patches/tool-activity/verify.mjs
+@@ -45,18 +45,15 @@ const read = (relative) => {
+   return readFileSync(path, 'utf8')
+ }
+ 
+-// 0.1.2-rc.1: dsh-client-runtime is gone and dsh-client-ui-conversation no
+-// longer carries the card — both live in dsh-client-ui-chat now, and the
+-// classifier is additionally inlined in dsh-client-ui-trajectory.
+-const runtime = read('dsh-client-ui-chat/lib/client.js')
+-const conversation = read('dsh-client-ui-chat/lib/client.js')
++const runtime = read('dsh-client-runtime/lib/client.js')
++const conversation = read('dsh-client-ui-conversation/lib/client.js')
+ const llm = read('dsh-llm/lib/index.js')
+ const trajectory = read('dsh-client-ui-trajectory/lib/client.js')
+ 
+ console.log(`tool-activity verify\nroot: ${root}\n`)
+ 
+ // --- 1. the classifier: the single fix that made the UI case reachable ------
+-console.log('dsh-client-ui-chat (classifier)')
++console.log('dsh-client-runtime')
+ {
+   const toAssistantBlock = new Function(
+     `${sliceFunction(runtime, 'toAssistantBlock')}; return toAssistantBlock;`,
+@@ -84,7 +81,7 @@ console.log('dsh-client-ui-chat (classifier)')
+ }
+ 
+ // --- 2. the card's pure helpers --------------------------------------------
+-console.log('\ndsh-client-ui-chat (card)')
++console.log('\ndsh-client-ui-conversation')
+ {
+   const summary = new Function(
+     `${sliceFunction(conversation, 'toolActivitySummary')}; return toolActivitySummary;`,
+@@ -210,49 +207,7 @@ console.log('\nwiring')
+   // what supplies the status dot, the divider and the exit-code suffix.
+   check('body is the native TerminalBlock', /primitives\.TerminalBlock, \{\s*command:/.test(conversation))
+   check('terminal is fed the parsed exit code', /TerminalBlock, \{[\s\S]{0,400}?exitCode: exit\.exitCode/.test(conversation))
+-  check('unknown exit codes fall back to a plain failure label', /labels: exit\.known \? TOOL_ACTIVITY_TERMINAL_LABELS : TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS/.test(conversation))
+-
+-  // Every primitive takes a REQUIRED, COMPLETE label set as of 0.1.2-rc.1
+-  // (upstream 3c10f5d2d3): they no longer merge a Partial over internal
+-  // defaults, they just read `labels.x`. A missing field is not a typing
+-  // nicety — it throws when the user expands the card and takes the whole
+-  // assistant message tree with it, which is exactly the bug this guards.
+-  // Field lists mirror packages/client/ui-primitives/src/<Block>.tsx.
+-  const labelObject = (name) => {
+-    const at = conversation.indexOf(`const ${name} = {`)
+-    if (at < 0) return undefined
+-    const from = conversation.indexOf('{', at)
+-    let depth = 0
+-    for (let i = from; i < conversation.length; i += 1) {
+-      if (conversation[i] === '{') depth += 1
+-      else if (conversation[i] === '}') {
+-        depth -= 1
+-        if (depth === 0) return conversation.slice(from, i + 1)
+-      }
+-    }
+-    return undefined
+-  }
+-  const REQUIRED_LABELS = {
+-    TOOL_ACTIVITY_TERMINAL_LABELS: ['signal', 'exitCode', 'running', 'failed', 'done', 'copy', 'copied', 'noOutput', 'collapseAria', 'collapse', 'expandAria', 'expand'],
+-    TOOL_ACTIVITY_READ_LABELS: ['window', 'copy', 'copied', 'collapseAria', 'expandAria', 'collapse', 'expand'],
+-    TOOL_ACTIVITY_DIFF_LABELS: ['copy', 'copied', 'collapseAria', 'expandAria', 'collapse', 'expand', 'files'],
+-  }
+-  for (const [name, fields] of Object.entries(REQUIRED_LABELS)) {
+-    const body = labelObject(name)
+-    const missing = body === undefined
+-      ? fields
+-      : fields.filter((field) => !new RegExp(`(^|[{,\\s])${field}\\s*:`).test(body))
+-    check(`${name} covers every field the primitive reads`, missing.length === 0,
+-      body === undefined ? 'label set not found' : `missing: ${missing.join(', ')}`)
+-  }
+-  const unknownExit = labelObject('TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS')
+-  check('the unknown-exit set spreads the full terminal set',
+-    unknownExit !== undefined && unknownExit.includes('...TOOL_ACTIVITY_TERMINAL_LABELS') && /exitCode\s*:/.test(unknownExit))
+-  // Every render site must actually hand the set over; an omitted prop is the
+-  // same crash as an incomplete one.
+-  check('TerminalBlock is given labels', /primitives\.TerminalBlock, \{[\s\S]{0,600}?labels:/.test(conversation))
+-  check('ReadBlock is given labels', /primitives\.ReadBlock, \{[\s\S]{0,600}?labels: TOOL_ACTIVITY_READ_LABELS/.test(conversation))
+-  check('DiffBlock is given labels', /primitives\.DiffBlock, \{[\s\S]{0,600}?labels: TOOL_ACTIVITY_DIFF_LABELS/.test(conversation))
++  check('unknown exit codes fall back to a plain failure label', /labels: exit\.known \? void 0 : TOOL_ACTIVITY_UNKNOWN_EXIT_LABELS/.test(conversation))
+   check('terminal css vars match the native bash card', conversation.includes('--dsl-terminal-output-max-height:224px'))
+   check('no leftover IN/OUT io-card markup', !conversation.includes('dsh-ta-io'))
+   // Read and Edit must reach the same primitives the native tool row uses,
+diff --git a/main.v20.mjs b/main.v20.mjs
+index e27dfb9..7683266 100644
+--- a/main.v20.mjs
++++ b/main.v20.mjs
+@@ -196,11 +196,12 @@
+ import { spawn } from 'node:child_process'
+ import { randomUUID } from 'node:crypto'
+ import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
+-import { ToolCallId, LlmError, createUserMessage, requestImageHandleText } from '@deepseek-ai/dsh-llm'
++import { CallId, LlmError, createUserMessage, requestImageHandleText } from '@deepseek-ai/dsh-llm'
+ import { defineTool } from '@deepseek-ai/dsh-tools'
++import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+ import z from '@deepseek-ai/schemastery'
+ 
+-const NS = 'llm-claude-code'
++const NS = settingsNamespace('llm-claude-code')
+ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
+ const MODELS = [
+   // Context windows mirror the CLI 2.1.258 registry: the current generation
+@@ -1584,7 +1585,7 @@ export function apply(ctx, rawConfig = {}) {
+     }
+     let permissionPreset
+     try {
+-      permissionPreset = permissionPresets?.current?.(agent.session)
++      permissionPreset = permissionPresets?.current?.(agent.session.events)
+     } catch (error) {
+       logger?.warn?.('llm-claude-code: could not read permission preset: %o', error)
+     }
+@@ -1731,7 +1732,7 @@ export function apply(ctx, rawConfig = {}) {
+             z: await loadZod(),
+             tools: ctx.tools,
+             agents,
+-            callId: () => ToolCallId(`claude-code-bridge-${randomUUID()}`),
++            callId: () => CallId(`claude-code-bridge-${randomUUID()}`),
+             logger,
+           })
+         : undefined
+@@ -2132,11 +2133,9 @@ export function apply(ctx, rawConfig = {}) {
+     { provider: 'claude-code-main', displayName: config().providerName, settingsNs: NS, settingsPath: [] },
+   ])
+   ctx.llm.registerAdapter(['claude-code-main'], adapter)
+-  ctx.inject(['settings'], (settingsCtx) => {
+-    settingsCtx.settings.installSection(ctx, NS, Config, rawConfig, {
+-      setSource: (source) => { current = source },
+-      onChange: () => {},
+-    })
++  installSettingsSection(ctx, NS, Config, rawConfig, {
++    setSource: (source) => { current = source },
++    onChange: () => {},
+   })
+   logger.info('provider "claude-code-main" registered — Claude Agent SDK owns the native coding-agent loop')
+ }
