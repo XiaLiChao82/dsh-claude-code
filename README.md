@@ -172,3 +172,13 @@ git checkout <该提交> && git apply compat/dsh-0.1.1-rc.2.patch
   收掉上一轮的清单，而 Claude Code 原本的清单是跨轮保留的。
 - **有些失效是不报错的。** 插件对 DSH 的「软查询」有 7 处，DSH 改名之后它们会
   静默退回默认行为。这正是需要定期跑 `checkup.mjs` 的原因。
+- **别手工往 `~/.dsh/sessions/` 塞会话文件。** DSH 要求 `session.jsonl.zstd` 的第一个
+  zstd frame **恰好只有一行** header（判据见 DSH 的
+  `packages/session/session-persistence-jsonl/src/index.ts` → `assertZstdHeaderFrame`）——
+  列会话时只解第一帧就能拿到元数据。若把整个 JSONL 一次性压成单帧，`workspace` 插件在
+  `cordis.init` 里枚举会话时会抛 `corrupt Zstandard session log: first frame is not
+  exactly one header line`，**整棵 cordis 插件树加载失败，`dsh web` 直接起不来**。
+  症状很有迷惑性：进程里已建立的会话照常能跑，但一刷新页面侧边栏就全空——
+  看着像「会话丢了」，实际是列举整个失败。DSH 在这里没有单条会话的容错降级，
+  一个坏文件拖垮全部工作区。造探针会话就分两次压（header 单独一帧，其余一帧），
+  或者干脆别放进真实会话目录。这里踩过一次。

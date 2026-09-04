@@ -93,6 +93,27 @@ console.log('\ndsh-client-ui-chat (card)')
   check('summary falls back to command', summary({ input: { command: 'npm test' } }) === 'npm test')
   check('summary uses first line only', summary({ input: { command: 'a\nb' } }) === 'a')
   check('summary reads file_path', summary({ input: { file_path: '/tmp/x' } }) === '/tmp/x')
+  // Regression guard: DSH's read/write/edit are str-replace-editor-shaped and
+  // send a `command` DISCRIMINATOR ("read"/"write"/"edit") next to the path. A
+  // command-first order renders `Read read` / `Write write` / `Edit edit` and
+  // drops the path entirely. No other check pairs the two keys, which is how
+  // that regression slipped through.
+  check(
+    'summary prefers file_path over the command discriminator',
+    summary({ input: { command: 'read', file_path: '/tmp/x' } }) === '/tmp/x',
+    summary({ input: { command: 'read', file_path: '/tmp/x' } }),
+  )
+  // ...and that order must not steal bash's summary: a real command has no file_path.
+  check('bash summary still uses its command', summary({ input: { command: 'ls -la' } }) === 'ls -la')
+  // Same class of bug one key over: grep/glob send `pattern` (what) together
+  // with `path` (where). Path-first summarized a search by its directory.
+  check(
+    'search summary prefers pattern over its search path',
+    summary({ input: { pattern: 'TODO', path: '/src' } }) === 'TODO',
+    summary({ input: { pattern: 'TODO', path: '/src' } }),
+  )
+  // A bare `path` (no pattern) must still reach the summary.
+  check('a path-only tool still summarizes its path', summary({ input: { path: '/src/x.ts' } }) === '/src/x.ts')
   check('summary survives absent input', summary({}) === '')
   check('summary caps runaway length', summary({ input: { command: 'x'.repeat(9000) } }).length === 241)
 
