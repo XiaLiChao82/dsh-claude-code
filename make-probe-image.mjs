@@ -41,6 +41,6 @@ const png = Buffer.concat([
   chunk('IDAT', deflateSync(raw)),
   chunk('IEND', Buffer.alloc(0)),
 ])
-writeFileSync('/home/sumer/Workspaces/Chat/1/llm-claude-code/probe-stripes.png', png)
+writeFileSync('/home/sumer/Workspaces/Agent/DSH-Plugin/llm-claude-code/probe-stripes.png', png)
 console.log('bytes:', png.length)
 console.log('base64 length:', png.toString('base64').length)

@@ -572,7 +572,7 @@ smoke 已确认 hook 实际收到 AskUserQuestion、Claude 收到 Blue 答案并
 ## 安装（改名 + patch.yml 指向；本部署 hmr 禁用，需重启 dsh web 生效）
 
 ```sh
-cp /home/sumer/Workspaces/Chat/1/llm-claude-code/main.v20.mjs \
+cp /home/sumer/Workspaces/Agent/DSH-Plugin/llm-claude-code/main.v20.mjs \
    /home/sumer/.dsh/profiles/web/plugins/llm-claude-code/main.v20.mjs
 # ~/.dsh/profiles/web/cordis.patch.yml 中 llm-claude-code 行的 name 改指
 # ./plugins/llm-claude-code/main.v20.mjs，然后重启 dsh web。
@@ -585,9 +585,14 @@ cp /home/sumer/Workspaces/Chat/1/llm-claude-code/main.v20.mjs \
 ## 测试
 
 ```sh
-node --check /home/sumer/Workspaces/Chat/1/llm-claude-code/main.v20.mjs
+node --check /home/sumer/Workspaces/Agent/DSH-Plugin/llm-claude-code/main.v20.mjs
 node --test /home/sumer/Workspaces/Chat/1/llm-claude-code.test.mjs
 ```
+
+> 上面第二行那个 `llm-claude-code.test.mjs` **不在本仓库内**（它在旧工作区
+> `~/Workspaces/Chat/1/` 下），而且 import 的是早已归档进
+> `main-versions-v10-v28.tar.gz` 的 `main.v21.mjs`，现在跑不起来。
+> 当前可用的测试是 `verify-compact.mjs`、`checkup.mjs` 和 `e2e-*.mjs`。
 
 2026-09-02：**22/22 通过**——v19 AskUserQuestion → DSH 问题卡的字段/答案
 转换、取消/无 provider 失败保护、PreToolUse hook envelope 与真实 Claude
