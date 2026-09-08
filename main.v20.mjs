@@ -789,7 +789,17 @@ export async function prepareImageBlocks(refs, attachments, policy, signal) {
     }
     prepared.set(ref.attachmentId, {
       block: { type: 'image', source: { type: 'base64', media_type: version.mediaType, data } },
-      handle: requestImageHandleText(version),
+      // (ref, version) — NOT (version). Identity comes from the occurrence's own
+      // DURABLE ref while the dimensions come from the prepared request version:
+      // one version is shared by every occurrence of the same attachment id, so
+      // the two arguments are genuinely different objects and cannot be folded.
+      // Passing only the version made `ref` the version and `version` undefined,
+      // and the helper's first statement reads `version.width` -> TypeError
+      // "Cannot read properties of undefined (reading 'width')" on every send
+      // that carried an image. `access` stays omitted: without it the helper
+      // emits the plain "may be resized or re-encoded" wording, which is what
+      // this route wants — it has no tool-execution world to resolve a path in.
+      handle: requestImageHandleText(ref, version),
     })
   }
   return prepared

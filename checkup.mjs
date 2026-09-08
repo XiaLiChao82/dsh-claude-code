@@ -209,6 +209,88 @@ check('semantics', 'DSH 仍注册 todo_write 工具', todoToolHits.length > 0,
   '桥接按名字挑不到工具，而内层原生 TodoWrite 已被关掉 → 内层一个 todo 工具都没有，计划面板全程空白（v30）',
   todoToolHits.length === 0 ? '整个 DSH 树里搜不到这个工具名 — BRIDGED_TOOL_NAMES 要跟着改' : undefined)
 
+// ---------------------------------------------------------------- llm api
+// 上面每一节都是「按名字查表」——服务名、方法名、工具名，插件用字符串找它们。
+// 这一节不是：main.v20.mjs 直接 `import { ... } from '@deepseek-ai/dsh-llm'`，
+// 是编译期绑定。两种漂移的可见度天差地别：
+//
+//   名字没了       → 插件加载时立刻炸，一眼能看见，谁也漏不掉。
+//   签名变了       → 加载照常成功，要等真正走到那条代码路径才炸。
+//
+// 后者是这一节存在的唯一理由。真实案例：requestImageHandleText 从 (version)
+// 变成 (ref, version, access?) 之后，只有「带图片发一条消息」会踩到，报
+// `Cannot read properties of undefined (reading 'width')`；静态体检、冒烟测试、
+// 日常纯文本对话全部照常通过，问题被藏了整整一个版本。
+//
+// 注意这一节读的是 NODE 解析出来的那份 dsh-llm，不是 --root 指的那棵树 —— 插件
+// 运行时加载的就是前者，两者不一致时前者才是真相。
+heading('dsh-llm 的导出契约（编译期绑定，签名漂移要到运行时才炸）')
+
+const LLM_PKG = '@deepseek-ai/dsh-llm'
+let llm
+try {
+  llm = await import(LLM_PKG)
+} catch (error) {
+  check('llm-api', `${LLM_PKG} 可导入`, false,
+    '插件加载时就会失败 — 确认 node_modules/@deepseek-ai/dsh-llm 的 symlink 还指向当前 DSH 安装',
+    String(error?.code ?? error?.message ?? error))
+}
+
+if (llm !== undefined) {
+  // 导入清单从源码现读，不在这里再抄一份：抄一份迟早跟源码分家，
+  // 那时这节检查的就是一份过期名单，比不检查更糟。
+  const mainSrc = readIf(ownPath('main.v20.mjs')) ?? ''
+  const importLine = /import\s*\{([^}]*)\}\s*from\s*'@deepseek-ai\/dsh-llm'/.exec(mainSrc)
+  const imported = importLine === null
+    ? []
+    : importLine[1].split(',').map((n) => n.trim().split(/\s+as\s+/)[0]).filter((n) => n.length > 0)
+
+  check('llm-api', '能从 main.v20.mjs 解析出 dsh-llm 的导入清单', imported.length > 0,
+    '这一节等于没跑 — import 的写法变了，把这里的正则跟着改',
+    importLine === null ? '匹配不到 import 语句' : undefined)
+
+  for (const name of imported) {
+    check('llm-api', `dsh-llm 仍导出 ${name}`, llm[name] !== undefined,
+      '插件 import 失败 → 整个插件加载不了（main.v20.mjs 直接 import 了它）')
+  }
+
+  // --- requestImageHandleText：唯一一个已经真实咬过人的签名 ---------------
+  // 两条检查刻意分开，因为它们抓的是不同的漂移，谁也替代不了谁。
+  const handleText = llm.requestImageHandleText
+
+  // 个数：抓「多一个 / 少一个参数」。可选参数只要没写默认值就计入
+  // Function.length，所以上游哪天给 access 加个默认值，这里也会响一声 ——
+  // 对这种一响就要人去核对的检查，保守误报远好过漏报。
+  check('llm-api', 'requestImageHandleText 仍是 3 参数 (ref, version, access?)',
+    typeof handleText === 'function' && handleText.length === 3,
+    '带图片发送时报 Cannot read properties of undefined — prepareImageBlocks 的调用点要跟着改',
+    typeof handleText === 'function' ? `实际参数个数: ${handleText.length}` : '不是函数')
+
+  // 顺序：参数个数不变的对调，上面那条一点办法都没有，只能真调一次。
+  // 探针的 ref 和 version 刻意给不同的尺寸（1600x1200 vs 800x600），参数一旦
+  // 对调，断言的 800x600 立刻落空。
+  if (typeof handleText === 'function') {
+    const probeRef = {
+      attachmentId: 'sha256:checkup',
+      name: 'checkup.png',
+      mediaType: 'image/png',
+      width: 1600,
+      height: 1200,
+    }
+    const probeVersion = { mediaType: 'image/png', width: 800, height: 600 }
+    let text
+    try {
+      text = handleText(probeRef, probeVersion)
+    } catch (error) {
+      text = `抛错: ${String(error?.message ?? error)}`
+    }
+    check('llm-api', 'requestImageHandleText 的标识取自 ref、尺寸取自 version',
+      text.includes('sha256:checkup') && text.includes('800x600'),
+      '带图片发送时文案错乱或直接抛错（参数对调了，个数没变，上一条抓不到）',
+      `实际返回: ${text.slice(0, 120)}`)
+  }
+}
+
 // ---------------------------------------------------------------- ui patches
 // These four live INSIDE the DSH install, so an upgrade always wipes them.
 heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
