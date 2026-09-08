@@ -116,6 +116,23 @@ console.log('\ndsh-client-ui-chat (card)')
   check('a path-only tool still summarizes its path', summary({ input: { path: '/src/x.ts' } }) === '/src/x.ts')
   check('summary survives absent input', summary({}) === '')
   check('summary caps runaway length', summary({ input: { command: 'x'.repeat(9000) } }).length === 241)
+  // Skill sends `{skill, args}` and AskUserQuestion `{questions: [...]}` — no
+  // key either one sends appears anywhere earlier in the chain, so before this
+  // both cards rendered with an empty summary line.
+  check('summary shows the skill name', summary({ input: { skill: 'apifox-cli', args: '' } }) === 'apifox-cli')
+  check(
+    'summary digs the question out of the questions array',
+    summary({ input: { questions: [{ question: '选哪个方案？', header: '方案' }] } }) === '选哪个方案？',
+    summary({ input: { questions: [{ question: '选哪个方案？', header: '方案' }] } }),
+  )
+  // A throw in this helper takes down the whole assistant message tree, so every
+  // malformed shape must degrade to "" instead.
+  check('a non-array questions degrades to empty', summary({ input: { questions: 'x' } }) === '')
+  check('an empty questions array degrades to empty', summary({ input: { questions: [] } }) === '')
+  check('a question entry without text degrades to empty', summary({ input: { questions: [{ header: 'x' }] } }) === '')
+  check('a null question entry does not throw', summary({ input: { questions: [null] } }) === '')
+  // The two new keys sit last on purpose: nothing above them may be displaced.
+  check('description still outranks the new keys', summary({ input: { description: 'run', skill: 'x' } }) === 'run')
 
   const inputText = new Function(
     `${sliceFunction(conversation, 'toolActivityInputText')}; return toolActivityInputText;`,
