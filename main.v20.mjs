@@ -2175,11 +2175,39 @@ export function apply(ctx, rawConfig = {}) {
             // escalations it could never see headless (default
             // bypassPermissions; configurable via llm-claude-code.permissionMode).
             ...buildPermissionOptions(effectivePermissionMode),
-            // canUseTool is retained alongside the hook because the SDK uses
-            // its presence to expose AskUserQuestion in headless mode. Under
-            // bypass it may be shadowed for ordinary tools (expected warning),
-            // but PreToolUse remains the authoritative gate for this one
-            // interaction tool. The hook routes it to the native DSH card.
+            // canUseTool is retained alongside the hook, and NOT as a gate.
+            //
+            // Passing it makes the SDK push `--permission-prompt-tool stdio`,
+            // and that flag is what lets a headless inner CLI expose the
+            // built-in AskUserQuestion at all. The callback itself allows
+            // everything except AskUserQuestion; PreToolUse is the
+            // authoritative gate for that one tool and routes it to DSH's
+            // native question card.
+            //
+            // EXPECTED, DO NOT "FIX": every query() prints
+            //   (node) [CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] Warning: canUseTool
+            //   will not be invoked: permissionMode 'bypassPermissions' ...
+            // The SDK emits it whenever canUseTool is present AND the mode is
+            // bypassPermissions — both deliberate here. It is one
+            // process.emitWarning and changes no behaviour. What bypass
+            // shadows is the ordinary-tool arm, which returns
+            // {behavior:'allow'} anyway, so nothing is lost. emitWarning does
+            // not dedupe, hence once per turn.
+            //
+            // Both apparent fixes are worse:
+            //   · dropping canUseTool also drops the flag -> the inner session
+            //     can no longer ask anything (trades a real feature for a log).
+            //   · passing permissionPromptToolName:'stdio' with no callback
+            //     does silence it (the check reads !!canUseTool), but the SDK
+            //     throws "canUseTool callback is not provided." if a
+            //     can_use_tool request ever arrives — betting on undocumented
+            //     CLI behaviour, i.e. a crash instead of a warning.
+            // Leaving bypassPermissions is not on the table either: v17 chose
+            // it because a headless inner session can never answer a prompt.
+            //
+            // checkup.mjs pins the flag mechanism, so if the SDK ever grows a
+            // standalone switch for exposing AskUserQuestion, this whole
+            // argument expires loudly instead of silently.
             ...(resolved.askUserQuestion ? { canUseTool } : {}),
             // Resume needs the session file on disk; force persistence while
             // nativeResume is enabled regardless of the legacy default.

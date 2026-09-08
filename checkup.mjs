@@ -291,6 +291,53 @@ if (llm !== undefined) {
   }
 }
 
+// ---------------------------------------------------------------- sdk switch
+// 这一节只为一件事存在：判断 main.v20.mjs 里那个 canUseTool 还能不能删掉。
+//
+// dsh web 的终端每轮都会打一条
+//   (node) [CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] Warning: canUseTool will not be
+//   invoked: permissionMode 'bypassPermissions' ...
+// 它是对的但无害：bypass 抢在回调前放行普通工具，而插件那个回调对普通工具本
+// 来就返回 allow，什么也没丢。AskUserQuestion 的真正门控是 PreToolUse hook。
+//
+// 那为什么还传 canUseTool？因为传它会让 SDK 往 CLI 推
+// `--permission-prompt-tool stdio`，而这个 flag 才是 headless 内层会话能暴露
+// 内置 AskUserQuestion 的开关。删掉 canUseTool 就等于用一个真实功能去换一条
+// 日志。整个判断依赖的就是「canUseTool 是这个 flag 的唯一来源」。
+//
+// 所以这里钉住机制本身，而不是钉住警告。SDK 哪天给暴露 AskUserQuestion 加了
+// 独立开关，这条就会响，届时 canUseTool 可以真的去掉、警告自然消失 —— 目的是
+// 让那段注释里的论证过期时出声，而不是悄悄变成一段过时的辩解。
+heading('Agent SDK 的开关机制（决定 CAN_USE_TOOL_SHADOWED 警告能不能消掉）')
+
+let sdkSrc
+try {
+  sdkSrc = readIf(fileURLToPath(await import.meta.resolve('@anthropic-ai/claude-agent-sdk')))
+} catch {
+  sdkSrc = undefined
+}
+check('sdk', 'Agent SDK 能定位到', sdkSrc !== undefined,
+  '这一节等于没跑 — 换到装了 @anthropic-ai/claude-agent-sdk 的目录跑（工作区或 profile）')
+
+if (sdkSrc !== undefined) {
+  // 压缩后变量名会变，字符串字面量不会 —— 只匹配字面量。
+  check('sdk', 'canUseTool 仍是 --permission-prompt-tool stdio 的来源',
+    sdkSrc.includes('"--permission-prompt-tool","stdio"'),
+    'canUseTool 的保留理由可能已失效 — 复核 main.v20.mjs 那段注释：若 SDK 改用别的开关暴露 AskUserQuestion，就能删掉 canUseTool 并顺带消掉那条警告',
+    '搜不到这个字面量，SDK 的 flag 机制变了')
+
+  // 互斥关系还在，才说明「只传 permissionPromptToolName 不传回调」依旧是那条
+  // 会抛错的歪路，而不是一条已经被 SDK 支持的正路。
+  check('sdk', 'canUseTool 与 permissionPromptToolName 仍互斥',
+    sdkSrc.includes('canUseTool callback cannot be used with permissionPromptToolName'),
+    '备选修法的前提变了 — 重新评估能不能改用 permissionPromptToolName 绕掉警告')
+
+  check('sdk', '警告仍出自 process.emitWarning（纯诊断，不改行为）',
+    sdkSrc.includes('CLAUDE_SDK_CAN_USE_TOOL_SHADOWED'),
+    '警告消失或换了实现 — 是好消息，但要确认它没变成真的行为约束',
+    '搜不到这个 code')
+}
+
 // ---------------------------------------------------------------- ui patches
 // These four live INSIDE the DSH install, so an upgrade always wipes them.
 heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
