@@ -10,6 +10,9 @@ node_modules/
 # 生成物：跑 make-probe-image.mjs 就能重新生成，不必入库
 probe-stripes.png
 
+# 探针两阶段之间的中间文件：阶段一写、阶段二读，内容是本机的会话 id
+probes/driver-probe-ids.json
+
 # 编辑器与系统垃圾文件
 .DS_Store
 *.swp

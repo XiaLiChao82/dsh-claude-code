@@ -656,7 +656,7 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
 // 有人把 id 改回 toolCallId 时，正向断言依然全绿。
 //
 // 注意本文件跑的是假 ctx，装不下真 projection，所以这层只能查形状。
-// 真 fold 的验证要用 .probe-subagent 的 --patch + headless 探针。
+// 真 fold 的验证要用 probes/ 的 --patch + headless 探针。
 {
   const call = buildMirrorToolCallBlock({ id: 'toolu_1', name: 'Bash', input: { command: 'echo hi' } })
   check('⑦ tool-call 用 id/name（不是 toolCallId/toolName）',

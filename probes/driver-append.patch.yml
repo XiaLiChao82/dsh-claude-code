@@ -1,0 +1,13 @@
+# 阶段一 overlay：用生产驱动 createMirrorDriver 把合成流写成真实子会话。
+#
+# llm-cursor 指向的 ~/.dsh/profiles/web/plugins/llm-cursor/index.mjs 并不存在，
+# 会让整棵配置树加载失败。这是 headless profile 的既有问题，与本探针无关；
+# 只在本次运行的 overlay 里跳过，不改动任何 profile 文件。
+- id: llm-cursor
+  disabled: true
+
+- insert:
+    - id: subagent-driver-probe
+      name: ./driver-probe.mjs
+      config:
+        mode: append

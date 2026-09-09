@@ -183,7 +183,7 @@ check('semantics', `turn/end 的单键 reason 仍是 ${SINGLE_KEY_REASONS.join('
   SINGLE_KEY_REASONS.every((kind) => reasonSwitch.includes(`case "${kind}":`))
   && reasonSwitch.includes('malformed pre-react-loop turn/end'),
   '镜像子会话的收尾事件过不了还原校验 → 界面上显示「会话记录损坏」',
-  '还原校验的 reason 白名单变了，改 createMirrorCollector/createMirrorDriver 的取值后必须重跑 .probe-subagent/driver-probe.mjs 两阶段')
+  '还原校验的 reason 白名单变了，改 createMirrorCollector/createMirrorDriver 的取值后必须重跑 probes/driver-probe.mjs 两阶段')
 
 // ---------------------------------------------------------------- semantics
 heading('DSH 的语义假设（改了不报错，但结果算错）')

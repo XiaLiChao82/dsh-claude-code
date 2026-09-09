@@ -830,7 +830,7 @@ export function createMirrorDriver({ sessions, logger, cwd, parentSessionId, mod
      * `aborted` needs a nested `reason`. Both of those pass append and pass
      * the projection fold, and only fail at COLD READ as "session log
      * corrupt", long after the turn they belong to. Verify with
-     * `.probe-subagent/driver-probe.mjs` before changing this value.
+     * `probes/driver-probe.mjs` before changing this value.
      *
      * @returns how many child sessions this stream opened.
      */

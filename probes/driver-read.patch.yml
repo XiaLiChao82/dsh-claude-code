@@ -1,0 +1,14 @@
+# 阶段二 overlay：全新进程冷读阶段一建出来的子会话。
+#
+# 必须与阶段一分进程：同进程 inspect 到的可能来自 live store，
+# 只有全新进程的冷读能证明真的落了盘、且过得了 projection fold。
+#
+# llm-cursor 的禁用理由同阶段一。
+- id: llm-cursor
+  disabled: true
+
+- insert:
+    - id: subagent-driver-probe
+      name: ./driver-probe.mjs
+      config:
+        mode: read

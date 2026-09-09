@@ -204,7 +204,7 @@ Claude Code 升级后若怀疑镜像失效，先跑 `node checkup.mjs --live`。
 - 镜像子会话没有 live Agent，因此父行的「N 个子代理运行中」活动指示器不会亮。子代理可列出、可点开，但没有实时运行状态。
 - 所有子事件折叠到 turn 1 / step 1。这是经真实 projection fold 与冷读验证过的形状；按内层每次模型调用拆分 step 的形态未经验证。
 - 中断、内层报错或进程被杀时，未返回结果的子会话由插件补 `turn/end`（`reason.kind: interrupted`）收尾。
-- 子会话事件形状的错误不会在写入时报错，只在冷读时表现为「会话记录损坏」。修改事件形状后必须重跑 `.probe-subagent/driver-probe.mjs` 的两阶段验证。
+- 子会话事件形状的错误不会在写入时报错，只在冷读时表现为「会话记录损坏」。修改事件形状后必须重跑 `probes/driver-probe.mjs` 的两阶段验证。
 
 ## 图片处理
 
@@ -357,8 +357,9 @@ node checkup.mjs --live
 | `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接、消息结构和子代理镜像；当前为 261 项 |
 | `checkup.mjs` | 读取当前 DSH 安装目录，检查服务名、方法签名、语义假设、补丁状态和安装状态 |
 | `checkup.mjs --live` | 在静态检查之外启动真实 Claude Code 会话，验证 SDK 输出格式及原生工具行为 |
+| `probes/`（两阶段，见 [probes/README.md](probes/README.md)） | 用生产驱动写出真实子会话再由全新进程冷读，验证镜像事件形状能过还原校验 |
 
-升级 DSH、Claude Code 或 Claude Agent SDK 后，至少运行前两项。模拟测试无法发现 DSH 内部服务改名等兼容性变化，因此不能替代 `checkup.mjs`。
+升级 DSH、Claude Code 或 Claude Agent SDK 后，至少运行前两项。模拟测试无法发现 DSH 内部服务改名等兼容性变化，因此不能替代 `checkup.mjs`；`checkup.mjs` 也不检查会话事件形状能否被还原校验接受，那一层只有 `probes/` 覆盖。
 
 如 DSH 安装位置不同，可指定包根目录：
 
