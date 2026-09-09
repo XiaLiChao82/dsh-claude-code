@@ -526,8 +526,39 @@ export function buildMirrorToolResultEvent({ turn = 1, step = 1, callId, text, i
   }, MIRROR_SURFACE]
 }
 
-/** The inner tool whose calls spawn a Claude Code subagent. */
-const MIRROR_TASK_TOOL = 'Task'
+/**
+ * The inner tool names whose calls spawn a Claude Code subagent.
+ *
+ * MEASURED, NOT ASSUMED. claude 2.1.263 dispatches subagents through a tool
+ * named `Agent` — NOT `Task`, which is what this file assumed from de537d8
+ * until a live SDK probe showed otherwise. That single wrong string silently
+ * disabled the whole mirror: no name match, no `open` action, no child
+ * session, and no error anywhere to notice. The offline self-check could not
+ * catch it either, because its fixtures were built from the same wrong
+ * assumption — a closed loop that proves only that the code agrees with
+ * itself.
+ *
+ * Both names are accepted because the CLI binary still carries both strings,
+ * so the older one may resurface in another version; accepting a name that
+ * never arrives costs nothing, missing the live one costs everything.
+ *
+ * checkup.mjs --live re-measures this against the real CLI.
+ */
+export const MIRROR_TASK_TOOLS = Object.freeze(['Agent', 'Task'])
+
+/**
+ * True when one tool-call block is a subagent dispatch.
+ *
+ * The name alone is not the test: `Agent` is a bare, unprefixed name, and a
+ * third-party MCP server is free to register one too (its calls would arrive
+ * as `mcp__<server>__Agent`, but a future bridge shape is not guaranteed).
+ * A real dispatch always carries the prompt handed down to the child, so
+ * requiring it keeps an unrelated tool from opening an empty child session.
+ */
+export function isMirrorTaskCall(block) {
+  if (block?.type !== 'tool_use' || !MIRROR_TASK_TOOLS.includes(block?.name)) return false
+  return typeof block.input?.prompt === 'string'
+}
 
 /**
  * Clamp for one mirrored tool result. The child session is a transcript, not a
@@ -600,12 +631,12 @@ export function createMirrorCollector({ provider = 'claude-code-task', model, se
       if (parentId === null || parentId === undefined) {
         if (message?.type === 'assistant') {
           for (const block of blocksOf(message)) {
-            if (block?.type !== 'tool_use' || block?.name !== MIRROR_TASK_TOOL) continue
+            if (!isMirrorTaskCall(block)) continue
             if (typeof block.id !== 'string') continue
             const input = block.input ?? {}
             // `description` is the short human label Claude Code sends with
-            // every Task; `subagent_type` names the persona it picked.
-            const label = String(input.description ?? input.subagent_type ?? MIRROR_TASK_TOOL)
+            // every dispatch; `subagent_type` names the persona it picked.
+            const label = String(input.description ?? input.subagent_type ?? block.name)
             open.set(block.id, label)
             actions.push({
               kind: 'open',

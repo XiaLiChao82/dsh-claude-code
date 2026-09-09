@@ -730,7 +730,7 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
 {
   const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
   const user = (parentId, content) => ({ type: 'user', parent_tool_use_id: parentId, message: { content } })
-  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Agent', input })
 
   {
     const c = createMirrorCollector({ senderSessionId: 'session-parent', model: 'claude-opus-5' })
@@ -795,12 +795,36 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
       c.observe(assistant('task-1', [{ type: 'text', text: '迟到' }])).length === 0)
   }
 
-  // 非 Task 工具不得触发镜像
+  // 非派发工具不得触发镜像
   {
     const c = createMirrorCollector({})
-    check('⑧ 非 Task 的 tool_use 不产出任何动作',
+    check('⑧ 非派发工具的 tool_use 不产出任何动作',
       c.observe(assistant(null, [{ type: 'tool_use', id: 'b1', name: 'Bash', input: {} }])).length === 0
       && c.openTaskIds().length === 0)
+  }
+
+  // 派发工具的名字判定。
+  //
+  // 这组是本文件最重要的回归钉：整个镜像曾经因为这一个字符串写错（'Task'，
+  // 真名是 'Agent'）而完全不工作，而当时的 fixture 用的也是 'Task'，所以
+  // ⑧⑨⑩ 全绿 —— 测试只证明了代码与自己一致。真名由 checkup --live 对着
+  // 真 CLI 重新测量，这里只钉住「两个名字都认」和「光有名字不够」。
+  {
+    for (const name of ['Agent', 'Task']) {
+      const c = createMirrorCollector({})
+      const acts = c.observe(assistant(null, [
+        { type: 'tool_use', id: 't1', name, input: { description: 'd', prompt: 'p' } },
+      ]))
+      check(`⑧ 派发工具名 ${name} 被识别`, acts.length === 1 && acts[0].kind === 'open')
+    }
+    const c = createMirrorCollector({})
+    check('⑧ 光有名字、没有 prompt 不算派发（防第三方同名工具开空会话）',
+      c.observe(assistant(null, [{ type: 'tool_use', id: 'x1', name: 'Agent', input: { foo: 1 } }])).length === 0
+      && c.openTaskIds().length === 0)
+    check('⑧ 派发工具名大小写敏感，Task/agent 变体不误认',
+      createMirrorCollector({}).observe(assistant(null, [
+        { type: 'tool_use', id: 'x2', name: 'agent', input: { prompt: 'p' } },
+      ])).length === 0)
   }
 
   // 未知父 id 的子消息不得触发（防止把别的东西当成子代理）
@@ -868,7 +892,7 @@ console.log('\n⑨ 镜像驱动')
     return { sessions, created, refuseEvent: (type) => { refuseEventType = type } }
   }
 
-  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Agent', input })
   const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
   const user = (parentId, content) => ({ type: 'user', parent_tool_use_id: parentId, message: { content } })
 
@@ -1008,7 +1032,7 @@ console.log('\n⑨ 镜像驱动')
 // ── ⑩ 接线（translateSdkMessages 的 mirror 钩子）──────────────────────
 console.log('\n⑩ 接线')
 await (async () => {
-  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Agent', input })
   const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
   const done = { type: 'result', subtype: 'success', is_error: false, result: 'done', usage: {} }
 
@@ -1062,6 +1086,69 @@ await (async () => {
     check('⑩ 不传 mirror 时行为不变', chunks.some((c) => c.type === 'finish'))
   }
 })()
+
+// ────────────────────────────────────────────────────────────────────────────
+// ⑪ 真实录制的 SDK 流
+//
+// 上面每一组喂给收集器的消息都是手写的，也就是说它们只能证明「代码与我对
+// Claude Code 的想象一致」。镜像整整一版完全不工作，而 ⑧⑨⑩ 全绿，就是这个
+// 闭环的代价：派发工具的真名是 Agent，fixture 里写的却是 Task。
+//
+// 这一组的数据是 `claude` 真跑一次派发子代理录下来的（fixtures/
+// subagent-stream.json，录制方式见 README），所以它锚定的是真实形状而不是
+// 想象。任何一处形状漂移都会在这里先炸。
+// ────────────────────────────────────────────────────────────────────────────
+console.log('\n⑪ 真实录制的 SDK 流')
+{
+  const stream = JSON.parse(readFileSync(new URL('./fixtures/subagent-stream.json', import.meta.url), 'utf8'))
+  const c = createMirrorCollector({ senderSessionId: 'session-parent', model: 'claude-haiku-4-5' })
+  const actions = []
+  for (const message of stream) actions.push(...c.observe(message))
+
+  const opens = actions.filter((a) => a.kind === 'open')
+  const closes = actions.filter((a) => a.kind === 'close')
+  const events = actions.filter((a) => a.kind === 'events')
+
+  // 录制里外层只派发了一个子代理
+  const dispatch = stream
+    .flatMap((m) => (m.parent_tool_use_id == null ? (m.message?.content ?? []) : []))
+    .find((b) => b.type === 'tool_use' && typeof b.input?.prompt === 'string')
+
+  check('⑪ 录制里确实有一次真实派发', dispatch !== undefined)
+  check(`⑪ 真实派发工具名是 ${dispatch?.name}`, dispatch?.name === 'Agent',
+    `实测 ${dispatch?.name} —— 若 Claude Code 改名，这里先炸`)
+  check('⑪ 真实流恰好开出一个子会话', opens.length === 1)
+  check('⑪ open 的 taskId 就是真实派发的 tool_use id', opens[0]?.taskId === dispatch?.id)
+  check('⑪ 子会话标题取自真实 description', opens[0]?.label === dispatch?.input?.description)
+  check('⑪ 真实的 subagent_type 被带上', opens[0]?.subagentType === dispatch?.input?.subagent_type)
+
+  // 子代理内部干的活（这次录制里是一次 Bash）必须进子会话。
+  //
+  // 形状按 DSH 的会话模型，不是按 SDK 的：工具调用是 assistant/message 里的
+  // 一个 tool-call 块，结果才是独立的 tool/result 事件。
+  const mirroredTypes = events.flatMap((a) => a.events.map((e) => e[0]))
+  const mirroredBlocks = events.flatMap((a) => a.events
+    .filter((e) => e[0] === 'assistant/message')
+    .flatMap((e) => e[1]?.message?.content ?? []))
+  const innerBash = mirroredBlocks.find((b) => b.type === 'tool-call')
+
+  check('⑪ 子代理内部的工具调用被镜像成 assistant/message 里的 tool-call 块',
+    innerBash !== undefined,
+    `实际块类型: ${[...new Set(mirroredBlocks.map((b) => b.type))].join(',') || '(空)'}`)
+  check('⑪ 镜像下来的就是子代理真跑的那个工具', innerBash?.name === 'Bash',
+    `实际 ${innerBash?.name}`)
+  check('⑪ 工具结果作为独立的 tool/result 事件进子会话',
+    mirroredTypes.includes('tool/result'),
+    `实际事件类型: ${[...new Set(mirroredTypes)].join(',') || '(空)'}`)
+
+  check('⑪ 真实流恰好收一次尾', closes.length === 1)
+  check('⑪ close 的 taskId 与 open 对应', closes[0]?.taskId === dispatch?.id)
+  // 录制里外层 tool_result 的 is_error 是 undefined 而不是 false —— 收集器
+  // 必须把「没说错」当成成功，否则每个正常返回的子代理都会被标成中断。
+  check('⑪ is_error 缺省（undefined）算成功，不是中断',
+    closes[0]?.events.find((e) => e[0] === 'turn/end')?.[1]?.reason?.kind === 'completed')
+  check('⑪ 收尾后没有悬空的子代理', c.openTaskIds().length === 0)
+}
 
 console.log(`\n${fail === 0 ? 'all checks passed' : fail + ' FAILED'} (${pass} passed)`)
 process.exit(fail === 0 ? 0 : 1)

@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url'
 // The one plugin import here: the descriptor-version check is only meaningful
 // if both sides come from the SAME constant, so hardcoding 3 in this file would
 // defeat the check the moment the plugin's value moved.
-import { MIRROR_DESCRIPTOR_VERSION } from './main.v20.mjs'
+import { MIRROR_DESCRIPTOR_VERSION, MIRROR_TASK_TOOLS, isMirrorTaskCall } from './main.v20.mjs'
 
 /** This bundle's package name, as `dsh plugin add` records it in the profile. */
 const PKG_NAME = 'dsh-llm-claude-code'
@@ -568,6 +568,78 @@ async function liveChecks() {
     '上下文压力又退回成累加值 → 进度条虚高、自动压缩提前触发（v22）')
   check('live', 'result 仍带累计用量', resultUsage !== undefined && typeof resultUsage.output_tokens === 'number',
     '成本统计拿不到输出 token（v22）')
+
+  await liveSubagentCheck(query)
+}
+
+/**
+ * Re-measure the two facts the subagent mirror depends on, against the real CLI.
+ *
+ * WHY THIS EXISTS: the mirror shipped completely dead because the dispatch tool
+ * was assumed to be named `Task` when this CLI calls it `Agent`. No offline
+ * assertion could have caught that — the fixtures encoded the same guess, so
+ * they only ever proved the code agreed with itself. The only way to know is to
+ * ask the real CLI, which is exactly what --live is for.
+ *
+ * The strong form of the assertion is used deliberately: rather than comparing
+ * the name against a string, the block the CLI actually emitted is fed to the
+ * PRODUCTION predicate. That covers the name, the input shape it also requires,
+ * and any future tightening of either — all at once.
+ */
+async function liveSubagentCheck(query) {
+  heading('子代理镜像的输入假设（Claude Code 改了派发工具就失效）')
+
+  // Retried because the probe depends on the model CHOOSING to delegate, and a
+  // small model sometimes just runs the echo itself. That is a flaky probe, not
+  // a finding — only a run where it never delegates across attempts says
+  // anything about Claude Code.
+  const ATTEMPTS = 3
+  let dispatchBlock
+  let sawChildMessage = false
+  let lastError
+
+  for (let attempt = 1; attempt <= ATTEMPTS && dispatchBlock === undefined; attempt++) {
+    try {
+      const q = query({
+        prompt: '立刻派发一个子代理（subagent），让它执行 `echo probe` 并汇报。'
+          + '你自己不要执行 echo，必须派发子代理。',
+        options: { model: 'haiku', permissionMode: 'bypassPermissions', maxTurns: 6 },
+      })
+      for await (const message of q) {
+        if (message?.parent_tool_use_id != null) sawChildMessage = true
+        if (message?.type !== 'assistant') continue
+        for (const block of message.message?.content ?? []) {
+          if (block?.type === 'tool_use' && dispatchBlock === undefined
+            && typeof block.input?.prompt === 'string' && block.input?.subagent_type !== undefined) {
+            dispatchBlock = block
+          }
+        }
+      }
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  if (dispatchBlock === undefined) {
+    check('mirror', `内层真的派发了子代理（试了 ${ATTEMPTS} 次）`, false,
+      lastError === undefined
+        ? '连续都没派发 — 多半仍是小模型不听话，但也可能是派发工具本身变了，值得手查一次'
+        : '探测会话起不来，测不到派发工具名',
+      lastError === undefined
+        ? '没有任何带 prompt + subagent_type 的 tool_use'
+        : String(lastError?.message ?? lastError).split('\n')[0])
+    return
+  }
+
+  check('mirror', `派发工具名仍被生产判定认出（实测 "${dispatchBlock.name}"）`,
+    isMirrorTaskCall(dispatchBlock),
+    '镜像会彻底静默失效：不匹配就没有 open 动作，没有子会话，也没有任何报错',
+    `实测名字 ${dispatchBlock.name} 不在 ${MIRROR_TASK_TOOLS.join('/')} 里，或 input 缺 prompt —— `
+    + '改 main.v20.mjs 的 MIRROR_TASK_TOOLS')
+
+  check('mirror', '子代理的消息仍带 parent_tool_use_id',
+    sawChildMessage,
+    '收集器靠它把子流归到对应子会话；没有它整个镜像无从分组')
 }
 
 if (LIVE) await liveChecks()

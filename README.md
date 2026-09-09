@@ -16,7 +16,7 @@
 - 在同一 DSH 会话内续接 Claude Code 原生会话，避免每轮完整重放历史。
 - 根据当前 Provider 分发 `/compact` 和 `/goal` 命令。
 - 支持 DSH 图片附件，并转换为 Anthropic Messages API 接受的图片内容块。
-- 将 Claude Code 用 `Task` 工具派发的子代理镜像为 DSH 子会话，使其出现在会话头部的子代理目录中。
+- 将 Claude Code 用 `Agent` 工具派发的子代理镜像为 DSH 子会话，使其出现在会话头部的子代理目录中。
 
 ## 系统架构
 
@@ -175,18 +175,29 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 
 ## 子代理镜像
 
-Claude Code 用自己的 `Task` 工具派发的子代理运行在 SDK 消息流的子流中（`parent_tool_use_id` 非 `null`）。这些消息不参与父会话的上下文占用采样，也不在父会话中显示工具活动；`mirrorSubagents` 启用时，插件额外把它们写成 DSH 子会话。
+Claude Code 用自己的 `Agent` 工具派发的子代理运行在 SDK 消息流的子流中（`parent_tool_use_id` 非 `null`）。这些消息不参与父会话的上下文占用采样，也不在父会话中显示工具活动；`mirrorSubagents` 启用时，插件额外把它们写成 DSH 子会话。
 
 镜像出的子会话与 DSH 原生子代理具有相同的可见性：出现在会话头部的子代理目录中，可点开查看完整内容。
 
 | SDK 事件 | 镜像动作 |
 | --- | --- |
-| 主流出现 `Task` 工具调用 | 建子会话，落 `subagent/descriptor`，写入 `turn/start` + 派发提示 + `step/start` |
+| 主流出现 `Agent` 工具调用 | 建子会话，落 `subagent/descriptor`，写入 `turn/start` + 派发提示 + `step/start` |
 | 子流的 assistant 消息 | 写入 `assistant/message`（推理、正文、工具调用块） |
 | 子流的工具结果 | 写入 `tool/result` |
-| 主流返回该 `Task` 的结果 | 写入 `step/end` + `turn/end` + `session/title` |
+| 主流返回该 `Agent` 调用的结果 | 写入 `step/end` + `turn/end` + `session/title` |
 
 镜像不写父会话记录，不重复执行任何工具，也不调用 LLM——被镜像的工作已由内层完成。持久化由 DSH 的 `sessionPersistence` 通过 `session/event` 订阅自行完成，插件不直接写盘。
+
+### 派发工具名
+
+派发工具的名字是实测值，不是约定值。claude 2.1.263 用的是 `Agent`；`MIRROR_TASK_TOOLS` 同时接受 `Agent` 与 `Task`（CLI 二进制中两个字符串均存在），并要求 `input.prompt` 存在，以免第三方同名工具开出空子会话。
+
+这个名字曾被假设为 `Task`，导致镜像完全静默失效：名字不匹配则不产生 `open` 动作，既无子会话也无任何报错，而离线断言因使用同一错误假设构造的 fixture 而全部通过。因此该假设由两处对真实数据的校验守护：
+
+- `checkup.mjs --live` 起一次真实内层会话，把 CLI 实际发出的 tool_use 块交给生产判定函数 `isMirrorTaskCall` 校验（模型偶尔不派发子代理，故重试 3 次）。
+- `fixtures/subagent-stream.json` 是一次真实派发的完整 SDK 消息流录制，`verify-compact.mjs` 的 ⑪ 组以它为形状锚点离线校验，无需起会话。
+
+Claude Code 升级后若怀疑镜像失效，先跑 `node checkup.mjs --live`。需要重新录制 fixture 时，用 SDK 跑一次派发子代理的会话并保留 `type`、`parent_tool_use_id` 及内容块的 `type`/`id`/`name`/`input`/`tool_use_id`/`content`/`is_error` 字段。
 
 约束与已知取舍：
 
@@ -228,7 +239,7 @@ Claude Code 用自己的 `Task` 工具派发的子代理运行在 SDK 消息流�
 | `toolResultDisplayChars` | `3000` | 工具结果的界面展示字符上限 |
 | `nativeResume` | `true` | 是否续接 Claude Code 原生会话 |
 | `dshTools` | `true` | 是否启用全部 DSH 工具桥接与原生工具替换 |
-| `mirrorSubagents` | `true` | 是否把内层 `Task` 子代理镜像为 DSH 子会话 |
+| `mirrorSubagents` | `true` | 是否把内层子代理镜像为 DSH 子会话 |
 
 `dshTools: false` 只关闭 DSH 工具桥接、相应原生工具替换和相关提示调整，不会回滚 Provider、图片、会话续接或命令分发等其他功能。
 
@@ -343,7 +354,7 @@ node checkup.mjs --live
 
 | 命令 | 验证范围 |
 | --- | --- |
-| `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接、消息结构和子代理镜像；当前为 244 项 |
+| `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接、消息结构和子代理镜像；当前为 261 项 |
 | `checkup.mjs` | 读取当前 DSH 安装目录，检查服务名、方法签名、语义假设、补丁状态和安装状态 |
 | `checkup.mjs --live` | 在静态检查之外启动真实 Claude Code 会话，验证 SDK 输出格式及原生工具行为 |
 
