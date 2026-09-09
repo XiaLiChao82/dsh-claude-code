@@ -20,6 +20,10 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+// The one plugin import here: the descriptor-version check is only meaningful
+// if both sides come from the SAME constant, so hardcoding 3 in this file would
+// defeat the check the moment the plugin's value moved.
+import { MIRROR_DESCRIPTOR_VERSION } from './main.v20.mjs'
 
 /** This bundle's package name, as `dsh plugin add` records it in the profile. */
 const PKG_NAME = 'dsh-llm-claude-code'
@@ -91,6 +95,7 @@ const HARD_SERVICES = [
   ['subprocess', '插件整个加载失败（解析 claude 可执行文件用它）'],
   ['tools', '插件整个加载失败（接收 DSH 工具目录用它）'],
   ['commands', '插件整个加载失败（注册 /compact 和 /goal 用它）'],
+  ['sessions', '插件整个加载失败（子代理镜像建子会话用它）'],
 ]
 const SOFT_SERVICES = [
   ['planMode', '计划模式静默退化成一句建议 — 内层照样改文件（v24）'],
@@ -100,6 +105,7 @@ const SOFT_SERVICES = [
   ['agents', '读不到当前会话 → 计划模式和权限映射双双失效（v24）'],
   ['attachments', '发图片报错（历史功能）'],
   ['userQuestions', '内层的 AskUserQuestion 问不出来（历史功能）'],
+  ['sessionPersistence', '镜像子会话只存在于内存，重启后消失（插件不直接调它，靠它订阅 session/event）'],
 ]
 
 heading('DSH 服务名（插件按名字找它们，改名即失效）')
@@ -140,6 +146,44 @@ check('methods', 'compaction.compactNow() 有实现', grepFiles('compactNow(').l
 const agentSrc = serviceSource('agents')
 check('methods', 'agents.currentInitiator() 存在', agentSrc !== undefined && agentSrc.includes('currentInitiator('),
   '拿不到当前会话 → 计划模式和权限映射双双失效（v24）')
+
+// 子代理镜像只调 sessions.create + session.append 两处，落盘不碰。
+const sessionSrc = serviceSource('sessions')
+check('methods', 'sessions.create(id, options) 存在', sessionSrc !== undefined && sessionSrc.includes('create(id, options)'),
+  '子代理镜像建不出子会话 → 内层 Task 在 DSH 里完全不可见')
+
+// 镜像【不】手动落盘，完全依赖协调器订阅 session/event 自行批量写盘。
+// 这不是实现细节而是本功能的地基：曾经手动调 sessionPersistence.append，
+// 结果成了同一份日志的第二个 writer，真 DSH 第二批就报
+// `append seq mismatch: expected 9, got 7`。反过来，如果 DSH 哪天不再自动
+// 订阅，镜像会静默退化成「只在内存里」——重启后子会话全部消失，而没有任何报错。
+const persistSrc = serviceSource('sessionPersistence')
+check('semantics', '持久化仍订阅 session/event 自动落盘',
+  persistSrc !== undefined && persistSrc.includes('ctx.on("session/event"'),
+  '镜像子会话不再自动落盘 → 重启后子代理全部消失（且无任何报错）',
+  persistSrc === undefined ? '找不到 sessionPersistence 的实现' : '订阅不见了，驱动需要自己负责落盘')
+
+// descriptor 的版本号是 DSH 分类子代理的依据。DSH 升版后若期望 4，
+// 镜像出来的子会话会被判成不支持的形态 —— 界面上表现为列不出来。
+const subagentSrc = readIf(join(ROOT, 'dsh-subagent/lib/index.js'))
+check('semantics', `subagent descriptor 版本仍是 ${MIRROR_DESCRIPTOR_VERSION}`,
+  subagentSrc !== undefined && subagentSrc.includes(`SUBAGENT_DESCRIPTOR_VERSION = ${MIRROR_DESCRIPTOR_VERSION}`),
+  '镜像的子会话被判成不支持的 descriptor → 子代理目录里列不出来',
+  subagentSrc === undefined ? '找不到 dsh-subagent' : 'DSH 换了版本号，buildMirrorDescriptor 要跟着改并重跑真 fold 验证')
+
+// turn/end 的 reason 是本功能踩过的最贵一个坑：`{kind:'error'}` 能通过写入、
+// 通过 projection fold，然后【只在冷读】被还原校验拒绝，界面上表现为
+// 「会话记录损坏」。放行的单键取值就是下面这四个，插件用 interrupted。
+// 这份清单若变了，镜像的收尾事件要重新选值并重跑 driver-probe 两阶段。
+const SINGLE_KEY_REASONS = ['completed', 'blocked', 'max-tokens', 'interrupted']
+const reasonSwitch = persistSrc === undefined ? '' : persistSrc.slice(
+  persistSrc.indexOf('function migrateLegacyTurnEndEvent'),
+  persistSrc.indexOf('function migrateLegacyTurnEndEvent') + 1200)
+check('semantics', `turn/end 的单键 reason 仍是 ${SINGLE_KEY_REASONS.join('/')}`,
+  SINGLE_KEY_REASONS.every((kind) => reasonSwitch.includes(`case "${kind}":`))
+  && reasonSwitch.includes('malformed pre-react-loop turn/end'),
+  '镜像子会话的收尾事件过不了还原校验 → 界面上显示「会话记录损坏」',
+  '还原校验的 reason 白名单变了，改 createMirrorCollector/createMirrorDriver 的取值后必须重跑 .probe-subagent/driver-probe.mjs 两阶段')
 
 // ---------------------------------------------------------------- semantics
 heading('DSH 的语义假设（改了不报错，但结果算错）')

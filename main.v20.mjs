@@ -231,6 +231,7 @@ export const DEFAULTS = {
   nativeResume: true,
   askUserQuestion: true,
   dshTools: true,
+  mirrorSubagents: true,
 }
 
 // Aggregate bound on base64 image payload per request, mirroring
@@ -286,6 +287,11 @@ const Config = z.object({
   // restart. The soft-fail path this shares with "zod is missing" is already
   // covered by tests.
   dshTools: z.boolean(),
+  // Mirror inner `Task` subagents into real DSH child sessions so they appear
+  // in the session-header subagent catalog. Purely additive: the mirror writes
+  // child sessions and never touches the parent transcript, so turning it off
+  // only removes those rows. See createMirrorDriver for the failure policy.
+  mirrorSubagents: z.boolean(),
 })
 
 const effortInfo = (id) => ({ id, name: id.charAt(0).toUpperCase() + id.slice(1) })
@@ -628,9 +634,18 @@ export function createMirrorCollector({ provider = 'claude-code-task', model, se
               isError: block.is_error === true,
               events: [
                 ['step/end', { turn: 1, step: 1 }, undefined],
+                // `interrupted`, NOT `error`, for a failed Task. Measured, not
+                // reasoned: restore validation accepts `completed` / `blocked`
+                // / `max-tokens` / `interrupted` as SINGLE-KEY reasons, while
+                // `error` additionally demands either an `error` field or a
+                // `step` + `failure{message,code}` pair. A bare
+                // `{kind:'error'}` passes append AND passes the projection
+                // fold, then fails the cold read with "malformed
+                // pre-react-loop turn/end" — i.e. the child reads as corrupt
+                // in the UI, on a code path only a FAILING subagent takes.
                 ['turn/end', {
                   turn: 1,
-                  reason: { kind: block.is_error === true ? 'error' : 'completed' },
+                  reason: { kind: block.is_error === true ? 'interrupted' : 'completed' },
                 }, undefined],
                 // Without a title the child shows as an unnamed row; the Task
                 // description is the only label the stream offers.
@@ -674,6 +689,136 @@ export function createMirrorCollector({ provider = 'claude-code-task', model, se
         if (events.length > 0) actions.push({ kind: 'events', taskId: parentId, events })
       }
       return actions
+    },
+  }
+}
+
+/**
+ * Drive one SDK stream's mirror actions into real DSH child sessions.
+ *
+ * WHY A SEPARATE LAYER: createMirrorCollector is a pure fold — no ctx, no
+ * session, no I/O — so the whole risky half can be tested against a fake ctx.
+ * This is the thin mapping that actually creates sessions, and it is kept
+ * deliberately dumb: create, append, forget.
+ *
+ * FULLY SYNCHRONOUS, AND THAT IS THE WHOLE POINT. Durability is not this
+ * layer's job: dsh-session-persistence subscribes to `session/event` and
+ * batches every append to disk on its own timer, exactly as it does for the
+ * parent session. An earlier version of this driver also called
+ * `sessionPersistence.append()` by hand and tracked a seq watermark — that was
+ * a SECOND writer for the same log, and the real DSH rejected it on the second
+ * batch ("append seq mismatch: expected 9, got 7") because the coordinator had
+ * already persisted seqs 7 and 8. Do not reintroduce manual persistence: the
+ * events published here are enough, and a hand-rolled watermark can only ever
+ * drift from the coordinator's.
+ *
+ * EVERY FAILURE IS SWALLOWED AND LOGGED. A broken mirror must not break the
+ * turn it is mirroring — the mirror is an extra view of work that already ran.
+ *
+ * @param sessions - the `sessions` service, read synchronously in apply().
+ * @param cwd - the parent's workspace; child headers key storage off it.
+ * @param parentSessionId - the DSH session the Task was dispatched from.
+ */
+export function createMirrorDriver({ sessions, logger, cwd, parentSessionId, model, provider = 'claude-code-task' }) {
+  const collector = createMirrorCollector({ senderSessionId: parentSessionId, model, provider })
+  /** taskId → the child being written, for Tasks that have not returned yet. */
+  const children = new Map()
+  /** Every child id this stream created, in order, for logs and cold-read checks. */
+  const openedIds = []
+
+  const warn = (what, error) => logger?.warn?.(`llm-claude-code: subagent mirror (${what}) failed: %o`, error)
+
+  /** Append triples one at a time: a rejected event must not cost the batch. */
+  const appendAll = (entry, triples) => {
+    for (const triple of triples) {
+      try {
+        appendMirrorEvent(entry.session, triple)
+      } catch (error) {
+        // A gap is better than a truncated child session.
+        warn(`append ${triple[0]}`, error)
+      }
+    }
+  }
+
+  const openChild = (action) => {
+    const id = `session-${randomUUID()}`
+    const session = sessions.create(id, {
+      meta: buildMirrorChildMeta({ cwd, parentSession: parentSessionId }),
+    })
+    // Without the descriptor this is merely a session: the registered
+    // `subagent` projection is the SOLE mode/label classifier, so a child
+    // carrying only origin/parentSession never reaches the catalog.
+    session.append('subagent/descriptor', buildMirrorDescriptor({ provider, label: action.label }))
+    const entry = { session, label: action.label }
+    children.set(action.taskId, entry)
+    openedIds.push(id)
+    appendAll(entry, action.events)
+  }
+
+  const applyAction = (action) => {
+    if (action.kind === 'open') return openChild(action)
+    const entry = children.get(action.taskId)
+    // A child whose creation failed still receives events and closes; dropping
+    // them here is what keeps one bad open from cascading.
+    if (entry === undefined) return
+    appendAll(entry, action.events)
+    if (action.kind === 'close') children.delete(action.taskId)
+  }
+
+  return {
+    /** Child session ids created so far, in dispatch order. */
+    childIds: () => [...openedIds],
+
+    /** Feed one raw SDK message. */
+    observe(message) {
+      let actions
+      try {
+        actions = collector.observe(message)
+      } catch (error) {
+        warn('fold', error)
+        return
+      }
+      for (const action of actions) {
+        try {
+          applyAction(action)
+        } catch (error) {
+          warn(action.kind, error)
+        }
+      }
+    },
+
+    /**
+     * Close whatever the stream never returned a result for — abort, inner
+     * error, or a killed process all leave a child sitting mid-turn, which
+     * reads as "still running" in a session that has no live Agent and can
+     * therefore never progress.
+     *
+     * `reason.kind: 'interrupted'` — same measured constraint as the close
+     * path: it is one of the four single-key reasons restore validation
+     * accepts, whereas `error` needs a `step` + `failure` envelope and
+     * `aborted` needs a nested `reason`. Both of those pass append and pass
+     * the projection fold, and only fail at COLD READ as "session log
+     * corrupt", long after the turn they belong to. Verify with
+     * `.probe-subagent/driver-probe.mjs` before changing this value.
+     *
+     * @returns how many child sessions this stream opened.
+     */
+    settle() {
+      for (const taskId of collector.openTaskIds()) {
+        const entry = children.get(taskId)
+        if (entry === undefined) continue
+        try {
+          appendAll(entry, [
+            ['step/end', { turn: 1, step: 1 }, undefined],
+            ['turn/end', { turn: 1, reason: { kind: 'interrupted' } }, undefined],
+            ['session/title', { title: entry.label, messageSeqs: [], source: { kind: 'fallback' } }, undefined],
+          ])
+        } catch (error) {
+          warn('unclosed task', error)
+        }
+      }
+      children.clear()
+      return openedIds.length
     },
   }
 }
@@ -725,7 +870,18 @@ const dshGoalModule = import('@deepseek-ai/dsh-command-goal').catch(() => undefi
 const DSH_GOAL_INPUT = Object.freeze({ hint: '[<objective>|clear|edit <objective>|pause|resume]', images: true })
 
 export const name = 'llm-claude-code'
-export const inject = ['llm', 'subprocess', 'tools', 'commands']
+// `sessions` is what the subagent mirror creates child sessions through. It is
+// a HARD requirement rather than a soft `ctx.get` read because a soft read
+// cordis was never told to wait for can return undefined while the service is
+// merely not ready yet — which would disable mirroring permanently on a startup
+// race instead of visibly. It ships with dsh-base and underpins every DSH
+// session, so a composition that runs an LLM turn at all has it.
+//
+// `sessionPersistence` is deliberately NOT injected: the mirror never calls it.
+// It subscribes to `session/event` and persists on its own, so a composition
+// without it degrades to memory-only child sessions (visible this run, gone
+// after a restart) rather than refusing to load this provider at all.
+export const inject = ['llm', 'subprocess', 'tools', 'commands', 'sessions']
 
 export function modelInfo(provider, model, contextWindow = DEFAULTS.contextWindow) {
   const entry = MODELS.find((item) => item.id === model)
@@ -1170,7 +1326,7 @@ export function isEchoOnlyUserMessage(message, echoIds) {
   return content.length > 0 && content.every((block) => block?.type === 'tool-result' && echoIds.has(block.toolCallId))
 }
 
-export async function* translateSdkMessages(messages, { showToolActivity = true, toolActivityDisplay = DEFAULTS.toolActivityDisplay, toolResultDisplayChars = DEFAULTS.toolResultDisplayChars, echoNameOf = () => ECHO_FALLBACK, onResult } = {}) {
+export async function* translateSdkMessages(messages, { showToolActivity = true, toolActivityDisplay = DEFAULTS.toolActivityDisplay, toolResultDisplayChars = DEFAULTS.toolResultDisplayChars, echoNameOf = () => ECHO_FALLBACK, onResult, mirror } = {}) {
   // native/fold are order-preserving. card still batches after the outer stream.
   // Unknown values clamp to native so a typo cannot silently restore batched cards.
   const activityDisplay = resolveToolActivityDisplay(toolActivityDisplay)
@@ -1239,6 +1395,20 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
   }
 
   for await (const message of messages) {
+    // Mirror FIRST and unconditionally: the four `parent_tool_use_id === null`
+    // filters below discard every sub-agent message (their context must not be
+    // sampled for occupancy, and their tools must not be re-displayed in the
+    // parent), and the mirror is the consumer that discarding starved. It needs
+    // the main-session messages too — a Task's tool_use opens a child and its
+    // tool_result closes one — so this cannot move inside a branch.
+    //
+    // Synchronous by contract (writes are queued in the driver) and never
+    // allowed to throw: mirroring is a side view, not part of the turn.
+    if (mirror !== undefined) {
+      try {
+        mirror(message)
+      } catch { /* the driver logs its own failures */ }
+    }
     if (message?.type === 'stream_event' && message.parent_tool_use_id === null) {
       const event = message.event
       if (event?.type === 'content_block_start') {
@@ -1941,6 +2111,11 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
   const logger = ctx.logger
+  // Taken SYNCHRONOUSLY, and never re-read per turn. Past the first await the
+  // cordis fiber may already be inactive, and then this getter throws while
+  // DSH's own soft `ctx.get(...)` reads start returning undefined — which
+  // fabricates misleading downstream errors instead of failing here.
+  const sessions = ctx.sessions
   // Per-DSH-session native-resume tracking: dsh session key →
   // { claudeSessionId, lastFedMessageId }. In-memory only — a host restart
   // simply falls back to one full-replay turn and re-seeds the entry.
@@ -2075,6 +2250,20 @@ export function apply(ctx, rawConfig = {}) {
       return { id: provider, name: config().providerName }
     },
     providerRetryPolicy() {
+      return undefined
+    },
+    // Declares no route-owned image pricing, exactly like the LlmAdapter base
+    // class does by default — DSH then falls back to its own neutral estimate.
+    //
+    // It has to be spelled out even though the default is "return undefined":
+    // this adapter is a plain object, so it inherits nothing from the abstract
+    // class, and LlmService.imageRequestPricing() calls the method WITHOUT an
+    // optional call (`adapters.get(p)?.adapter.imageRequestPricing(...)` guards
+    // only the lookup). Omitting it made every token measurement that priced
+    // history on this route throw `imageRequestPricing is not a function` —
+    // which is what surfaced as a raw TypeError out of /compact, since
+    // compactNow's failure is not a ManualCompactionError and gets rethrown.
+    imageRequestPricing() {
       return undefined
     },
     async listModels(provider) {
@@ -2266,8 +2455,22 @@ export function apply(ctx, rawConfig = {}) {
         if (prompt.trim().length === 0 && images.size === 0) throw new LlmError('llm-claude-code: request carried no usable text', 'INVALID_REQUEST')
         const sdkPrompt = buildSdkPrompt(prompt, [...images.values()].map((item) => item.block))
         const { sdkQuery, spawnFailureOf } = runQuery(sdkPrompt, resuming ? { resume: plan.resumeId, forkSession: true } : {})
+        // One driver per ATTEMPT, not per turn: a resume retry re-runs the
+        // whole inner turn, so its Tasks are dispatched again and would
+        // otherwise mirror twice into the same children. The failed attempt's
+        // children are closed by settle() in the finally below.
+        const mirror = resolved.mirrorSubagents
+          ? createMirrorDriver({
+            sessions,
+            logger,
+            cwd: workspace,
+            parentSessionId: options.sessionId,
+            model: options.model,
+          })
+          : undefined
         try {
           yield* translateSdkMessages(sdkQuery, {
+            mirror: mirror?.observe,
             showToolActivity: resolved.showToolActivity,
             toolActivityDisplay: resolveToolActivityDisplay(resolved.toolActivityDisplay),
             toolResultDisplayChars: resolved.toolResultDisplayChars,
@@ -2304,6 +2507,14 @@ export function apply(ctx, rawConfig = {}) {
         } finally {
           options.signal?.removeEventListener('abort', onAbort)
           sdkQuery.close()
+          // Synchronous, and contains every failure itself: an abort still
+          // closes the children's open turns, and throwing here would replace
+          // the turn's real error with a mirroring one. Durability is the
+          // persistence coordinator's job, so there is nothing to await.
+          if (mirror !== undefined) {
+            const opened = mirror.settle()
+            if (opened > 0) logger.info('llm-claude-code: mirrored %d Task subagent(s): %s', opened, mirror.childIds().join(' '))
+          }
         }
       }
     },

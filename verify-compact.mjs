@@ -1,5 +1,5 @@
 // 验证 v23 的 /compact 分流：不需要真的起 dsh，用假 ctx 跑一遍 apply。
-import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, appendMirrorEvent, buildMirrorChildMeta, buildMirrorDescriptor, buildMirrorToolCallBlock, buildMirrorToolResultBlock, buildMirrorUserEvent, buildMirrorAssistantEvent, buildMirrorToolResultEvent, createMirrorCollector, MIRROR_DESCRIPTOR_VERSION, DEFAULTS } from './main.v20.mjs'
+import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, appendMirrorEvent, buildMirrorChildMeta, buildMirrorDescriptor, buildMirrorToolCallBlock, buildMirrorToolResultBlock, buildMirrorUserEvent, buildMirrorAssistantEvent, buildMirrorToolResultEvent, createMirrorCollector, createMirrorDriver, translateSdkMessages, MIRROR_DESCRIPTOR_VERSION, DEFAULTS } from './main.v20.mjs'
 import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
@@ -824,10 +824,244 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
       && a[0].events[0][1].message.content[0].text === 'from A'
       && b[0].events[0][1].message.content[0].text === 'from B')
     const closedA = c.observe(user(null, [{ type: 'tool_result', tool_use_id: 't-a', content: [], is_error: true }]))
-    check('⑧ 失败的 turn/end 是 error', closedA[0].events[1][1].reason.kind === 'error')
+    check('⑧ 失败的 turn/end 是 interrupted（单键 reason，冷读唯一放行的形状）', closedA[0].events[1][1].reason.kind === 'interrupted')
     check('⑧ 关掉一个不影响另一个', c.openTaskIds().join() === 't-b')
   }
 }
+
+// ── ⑨ 镜像驱动（createMirrorDriver）───────────────────────────────────
+//
+// ⑧ 组止步于「收集器产出的动作对不对」。⑨ 组测的是把动作变成真实子会话的那
+// 一层。它最重要的一条断言不是「写了什么」，而是「没写什么」：
+//
+//   驱动【不得】调用 sessionPersistence —— dsh-session-persistence 自己订阅
+//   session/event 并按批落盘，驱动再手动 append 就成了同一份日志的第二个
+//   writer。第一版驱动正是这么写的，假 persistence 全绿，真 DSH 第二批就
+//   报 `append seq mismatch: expected 9, got 7`（协调器已经把 7、8 落了）。
+//   所以这里给一个「碰一下就失败」的假 persistence，把那次回归钉死。
+console.log('\n⑨ 镜像驱动')
+{
+  const logger = { info() {}, warn() {}, error() {}, debug() {} }
+
+  const makeFakes = () => {
+    const created = []
+    let refuseEventType = null
+    const sessions = {
+      create(id, options) {
+        const log = ['permission/preset', 'sandbox/mode', 'approval/policy']
+          .map((type, seq) => ({ seq, type }))
+        const session = {
+          id,
+          log,
+          append(type, data, opts) {
+            if (type === refuseEventType) throw new Error(`refused ${type}`)
+            const event = { seq: log.length, type, data, opts }
+            log.push(event)
+            return event
+          },
+        }
+        created.push({ id, meta: options?.meta, session })
+        return session
+      },
+      get: () => { throw new Error('驱动不应查 store') },
+    }
+    return { sessions, created, refuseEvent: (type) => { refuseEventType = type } }
+  }
+
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+  const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
+  const user = (parentId, content) => ({ type: 'user', parent_tool_use_id: parentId, message: { content } })
+
+  const drive = (fakes, extra = {}) => createMirrorDriver({
+    sessions: fakes.sessions,
+    logger,
+    cwd: '/w',
+    parentSessionId: 'session-parent',
+    model: 'claude-opus-5',
+    ...extra,
+  })
+
+  const eventsOf = (entry) => entry.session.log.map((e) => e.type)
+
+  // 一条完整的生命周期：open → events → close
+  {
+    const fakes = makeFakes()
+    const driver = drive(fakes)
+    driver.observe(assistant(null, [taskUse('t1', { description: '查缺口', prompt: '去查', subagent_type: 'Explore' })]))
+    driver.observe(assistant('t1', [{ type: 'text', text: '子代理正文' }]))
+    driver.observe(user('t1', [{ type: 'tool_result', tool_use_id: 'c1', content: [{ type: 'text', text: 'ok' }] }]))
+    driver.observe(user(null, [{ type: 'tool_result', tool_use_id: 't1', content: [], is_error: false }]))
+    const opened = driver.settle()
+
+    check('⑨ settle 是同步的（落盘不是它的职责）', typeof opened === 'number')
+    check('⑨ 一个 Task 建一个子会话', fakes.created.length === 1 && opened === 1)
+    check('⑨ childIds 报出建出来的子会话', driver.childIds().join() === fakes.created[0].id)
+    check('⑨ 子会话 id 是 session-<uuid>', /^session-[0-9a-f-]{36}$/.test(fakes.created[0].id))
+    const meta = fakes.created[0].meta
+    check('⑨ meta 带 origin=subagent（侧边栏与头部目录的分类依据）', meta?.origin === 'subagent')
+    check('⑨ meta 带 parentSession 与 cwd', meta?.parentSession === 'session-parent' && meta?.cwd === '/w')
+    const log = fakes.created[0].session.log
+    check('⑨ descriptor 紧跟 create 自动追加的 3 条之后', log[3]?.type === 'subagent/descriptor' && log[3]?.seq === 3)
+    check('⑨ descriptor 带版本与 Task 描述作标题', log[3]?.data?.version === MIRROR_DESCRIPTOR_VERSION && log[3]?.data?.label === '查缺口')
+    check('⑨ 开场是 turn/start + user/message + step/start',
+      eventsOf(fakes.created[0]).slice(4, 7).join() === 'turn/start,user/message,step/start')
+    const types = eventsOf(fakes.created[0])
+    check('⑨ 子代理正文与工具结果都进了子会话',
+      types.includes('assistant/message') && types.includes('tool/result'))
+    check('⑨ close 落 step/end + turn/end + session/title',
+      types.includes('step/end') && types.includes('turn/end') && types.includes('session/title'))
+    check('⑨ 全程 seq 由 session.append 递增，无空洞',
+      log.every((e, i) => e.seq === i))
+    check('⑨ 三个 surface 事件都带 surfaceOp（漏了只在冷读炸）',
+      log.filter((e) => ['user/message', 'assistant/message', 'tool/result'].includes(e.type))
+        .every((e) => e.opts?.surfaceOp === 'append'))
+    check('⑨ 非 surface 事件不带第三参数',
+      log.filter((e) => ['turn/start', 'step/start', 'turn/end'].includes(e.type))
+        .every((e) => e.opts === undefined))
+  }
+
+  // 回归钉：驱动碰 sessionPersistence 就算失败
+  {
+    const fakes = makeFakes()
+    const touched = []
+    const trap = new Proxy({}, { get: (_t, key) => { touched.push(String(key)); return () => {} } })
+    const driver = drive(fakes, { persistence: trap, sessionPersistence: trap })
+    driver.observe(assistant(null, [taskUse('t1', { description: 'P', prompt: 'p' })]))
+    driver.observe(assistant('t1', [{ type: 'text', text: 'x' }]))
+    driver.observe(user(null, [{ type: 'tool_result', tool_use_id: 't1', content: [] }]))
+    driver.settle()
+    check('⑨ 驱动不做第二个 writer（不碰 sessionPersistence）', touched.length === 0,
+      `碰了：${touched.join()}`)
+  }
+
+  // 并发两个 Task 必须落进两个不同子会话
+  {
+    const fakes = makeFakes()
+    const driver = drive(fakes)
+    driver.observe(assistant(null, [
+      taskUse('t-a', { description: 'A', prompt: 'pa' }),
+      taskUse('t-b', { description: 'B', prompt: 'pb' }),
+    ]))
+    driver.observe(assistant('t-a', [{ type: 'text', text: 'from A' }]))
+    driver.observe(assistant('t-b', [{ type: 'text', text: 'from B' }]))
+    driver.observe(user(null, [{ type: 'tool_result', tool_use_id: 't-a', content: [], is_error: true }]))
+    const opened = driver.settle()
+    check('⑨ 两个并发 Task 建两个子会话', fakes.created.length === 2 && opened === 2)
+    const a = fakes.created.find((c) => c.session.log[3]?.data?.label === 'A')
+    const b = fakes.created.find((c) => c.session.log[3]?.data?.label === 'B')
+    const textOf = (c) => c.session.log.filter((e) => e.type === 'assistant/message')
+      .flatMap((e) => e.data.message.content).map((x) => x.text).join()
+    check('⑨ 子流内容不混淆', textOf(a) === 'from A' && textOf(b) === 'from B')
+    check('⑨ 失败的 Task 收在 reason=interrupted 的 turn/end 上',
+      a.session.log.some((e) => e.type === 'turn/end' && e.data.reason.kind === 'interrupted'))
+    check('⑨ 成功的那一路才用 completed',
+      !a.session.log.some((e) => e.data?.reason?.kind === 'completed'))
+  }
+
+  // 中断：Task 没等到结果，settle 必须替它收尾，否则子会话永远停在半个 turn
+  {
+    const fakes = makeFakes()
+    const driver = drive(fakes)
+    driver.observe(assistant(null, [taskUse('t1', { description: '被中断的', prompt: 'p' })]))
+    driver.observe(assistant('t1', [{ type: 'text', text: '刚开始' }]))
+    driver.settle()
+    const types = eventsOf(fakes.created[0])
+    check('⑨ 未闭合的 Task 被 settle 补上 step/end + turn/end',
+      types.includes('step/end') && types.includes('turn/end'))
+    const end = fakes.created[0].session.log.find((e) => e.type === 'turn/end')
+    check('⑨ 收尾用冷读验证过的 interrupted（error/aborted 都会被判损坏）', end?.data?.reason?.kind === 'interrupted')
+    check('⑨ 收尾也补标题，避免无名行',
+      fakes.created[0].session.log.some((e) => e.type === 'session/title' && e.data.title === '被中断的'))
+  }
+
+  // 故障隔离：镜像坏掉不许影响它所镜像的那一轮
+  {
+    const fakes = makeFakes()
+    fakes.refuseEvent('assistant/message')
+    const driver = drive(fakes)
+    let threw = null
+    try {
+      driver.observe(assistant(null, [taskUse('t1', { description: 'Y', prompt: 'p' })]))
+      driver.observe(assistant('t1', [{ type: 'text', text: '会被拒' }]))
+      driver.observe(user(null, [{ type: 'tool_result', tool_use_id: 't1', content: [] }]))
+      driver.settle()
+    } catch (error) { threw = error }
+    check('⑨ 单条事件被拒不冒泡、也不拖累同批其余', threw === null
+      && !eventsOf(fakes.created[0]).includes('assistant/message')
+      && eventsOf(fakes.created[0]).includes('turn/end'))
+  }
+
+  // 服务缺失（组合里没有 sessions）不许让整轮崩
+  {
+    const driver = createMirrorDriver({ sessions: undefined, logger, cwd: '/w', parentSessionId: 's' })
+    let threw = null
+    try {
+      driver.observe(assistant(null, [taskUse('t1', { description: 'Z', prompt: 'p' })]))
+      driver.settle()
+    } catch (error) { threw = error }
+    check('⑨ 服务缺失时驱动静默降级，不抛异常', threw === null && driver.childIds().length === 0)
+  }
+
+  check('⑨ mirrorSubagents 默认开启', DEFAULTS.mirrorSubagents === true)
+}
+
+// ── ⑩ 接线（translateSdkMessages 的 mirror 钩子）──────────────────────
+console.log('\n⑩ 接线')
+await (async () => {
+  const taskUse = (id, input) => ({ type: 'tool_use', id, name: 'Task', input })
+  const assistant = (parentId, content) => ({ type: 'assistant', parent_tool_use_id: parentId, message: { content } })
+  const done = { type: 'result', subtype: 'success', is_error: false, result: 'done', usage: {} }
+
+  // 主流和子流都必须到达 mirror：open 靠主流的 Task tool_use，close 靠主流的
+  // tool_result，而内容靠子流。四处 `parent_tool_use_id === null` 过滤只能挡
+  // 显示路径，不能挡镜像路径。
+  {
+    const seen = []
+    const stream = (async function* () {
+      yield assistant(null, [taskUse('t1', { description: 'W', prompt: 'p' })])
+      yield assistant('t1', [{ type: 'text', text: '子流' }])
+      yield done
+    })()
+    for await (const chunk of translateSdkMessages(stream, { mirror: (m) => seen.push(m) })) void chunk
+    check('⑩ 主流与子流都到达 mirror', seen.length === 3
+      && seen[0].parent_tool_use_id === null && seen[1].parent_tool_use_id === 't1')
+  }
+
+  // showToolActivity: false 时也要镜像 —— 子会话与父会话的活动显示无关
+  {
+    const seen = []
+    const stream = (async function* () {
+      yield assistant(null, [taskUse('t1', { description: 'W', prompt: 'p' })])
+      yield assistant('t1', [{ type: 'text', text: '子流' }])
+      yield done
+    })()
+    for await (const chunk of translateSdkMessages(stream, { showToolActivity: false, mirror: (m) => seen.push(m) })) void chunk
+    check('⑩ 关掉工具活动显示不影响镜像', seen.length === 3)
+  }
+
+  {
+    const stream = (async function* () {
+      yield assistant(null, [taskUse('t1', { description: 'V', prompt: 'p' })])
+      yield done
+    })()
+    let threw = null
+    try {
+      for await (const chunk of translateSdkMessages(stream, { mirror: () => { throw new Error('boom') } })) void chunk
+    } catch (error) { threw = error }
+    check('⑩ mirror 抛异常不破坏外层流', threw === null)
+  }
+
+  // 不传 mirror 必须与接线前完全一致
+  {
+    const stream = (async function* () {
+      yield assistant(null, [{ type: 'text', text: 'hi' }])
+      yield done
+    })()
+    const chunks = []
+    for await (const chunk of translateSdkMessages(stream)) chunks.push(chunk)
+    check('⑩ 不传 mirror 时行为不变', chunks.some((c) => c.type === 'finish'))
+  }
+})()
 
 console.log(`\n${fail === 0 ? 'all checks passed' : fail + ' FAILED'} (${pass} passed)`)
 process.exit(fail === 0 ? 0 : 1)

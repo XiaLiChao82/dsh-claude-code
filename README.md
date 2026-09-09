@@ -16,6 +16,7 @@
 - 在同一 DSH 会话内续接 Claude Code 原生会话，避免每轮完整重放历史。
 - 根据当前 Provider 分发 `/compact` 和 `/goal` 命令。
 - 支持 DSH 图片附件，并转换为 Anthropic Messages API 接受的图片内容块。
+- 将 Claude Code 用 `Task` 工具派发的子代理镜像为 DSH 子会话，使其出现在会话头部的子代理目录中。
 
 ## 系统架构
 
@@ -172,6 +173,28 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 
 `showToolActivity: false` 可完全关闭工具活动投影。`toolResultDisplayChars` 控制单次工具结果在界面中的最大展示字符数。
 
+## 子代理镜像
+
+Claude Code 用自己的 `Task` 工具派发的子代理运行在 SDK 消息流的子流中（`parent_tool_use_id` 非 `null`）。这些消息不参与父会话的上下文占用采样，也不在父会话中显示工具活动；`mirrorSubagents` 启用时，插件额外把它们写成 DSH 子会话。
+
+镜像出的子会话与 DSH 原生子代理具有相同的可见性：出现在会话头部的子代理目录中，可点开查看完整内容。
+
+| SDK 事件 | 镜像动作 |
+| --- | --- |
+| 主流出现 `Task` 工具调用 | 建子会话，落 `subagent/descriptor`，写入 `turn/start` + 派发提示 + `step/start` |
+| 子流的 assistant 消息 | 写入 `assistant/message`（推理、正文、工具调用块） |
+| 子流的工具结果 | 写入 `tool/result` |
+| 主流返回该 `Task` 的结果 | 写入 `step/end` + `turn/end` + `session/title` |
+
+镜像不写父会话记录，不重复执行任何工具，也不调用 LLM——被镜像的工作已由内层完成。持久化由 DSH 的 `sessionPersistence` 通过 `session/event` 订阅自行完成，插件不直接写盘。
+
+约束与已知取舍：
+
+- 镜像子会话没有 live Agent，因此父行的「N 个子代理运行中」活动指示器不会亮。子代理可列出、可点开，但没有实时运行状态。
+- 所有子事件折叠到 turn 1 / step 1。这是经真实 projection fold 与冷读验证过的形状；按内层每次模型调用拆分 step 的形态未经验证。
+- 中断、内层报错或进程被杀时，未返回结果的子会话由插件补 `turn/end`（`reason.kind: interrupted`）收尾。
+- 子会话事件形状的错误不会在写入时报错，只在冷读时表现为「会话记录损坏」。修改事件形状后必须重跑 `.probe-subagent/driver-probe.mjs` 的两阶段验证。
+
 ## 图片处理
 
 插件从 DSH 的持久化附件服务读取用户消息中的图片，并转换为 SDK 流式输入。支持的媒体类型为：
@@ -205,6 +228,7 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 | `toolResultDisplayChars` | `3000` | 工具结果的界面展示字符上限 |
 | `nativeResume` | `true` | 是否续接 Claude Code 原生会话 |
 | `dshTools` | `true` | 是否启用全部 DSH 工具桥接与原生工具替换 |
+| `mirrorSubagents` | `true` | 是否把内层 `Task` 子代理镜像为 DSH 子会话 |
 
 `dshTools: false` 只关闭 DSH 工具桥接、相应原生工具替换和相关提示调整，不会回滚 Provider、图片、会话续接或命令分发等其他功能。
 
@@ -319,7 +343,7 @@ node checkup.mjs --live
 
 | 命令 | 验证范围 |
 | --- | --- |
-| `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接和消息结构；当前为 215 项 |
+| `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接、消息结构和子代理镜像；当前为 244 项 |
 | `checkup.mjs` | 读取当前 DSH 安装目录，检查服务名、方法签名、语义假设、补丁状态和安装状态 |
 | `checkup.mjs --live` | 在静态检查之外启动真实 Claude Code 会话，验证 SDK 输出格式及原生工具行为 |
 
@@ -361,6 +385,8 @@ node checkup.mjs --root /path/to/dsh/node_modules/@deepseek-ai
 - `native` 模式的 Web 补丁不属于 npm 包可持久维护的文件，DSH 升级后需要重新应用。
 - 当前补丁探测逻辑与实际需要补丁的显示模式不一致；这是已记录的实现问题，部署检查应以补丁验证脚本和 `checkup.mjs` 为准。
 - `checkup.mjs` 的默认 DSH 包路径与当前开发环境相关；其他环境应使用 `--root`。
+- 镜像子会话不显示实时运行状态，且不随父会话的历史编辑或分支切换回滚。
+- `turn/end` 的 `reason` 只有 `completed`、`blocked`、`max-tokens`、`interrupted` 四个单键取值能通过 DSH 的还原校验；`error` 与 `aborted` 需要额外字段，写错只在冷读时暴露。
 
 ## License
 
