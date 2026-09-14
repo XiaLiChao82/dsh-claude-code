@@ -1,0 +1,10 @@
+# `live` 模式写进主会话的事件形状验证。单进程跑完，无需分两阶段。
+#
+# llm-cursor 的禁用理由同 driver-append：那个 profile 里它指向一个不存在的
+# 文件，会让整棵配置树加载失败——与本探针无关，只在本次运行的 overlay 里跳过。
+- id: llm-cursor
+  disabled: true
+
+- insert:
+    - id: live-settlement-probe
+      name: ./settlement-probe.mjs

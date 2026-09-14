@@ -7,6 +7,124 @@
 // acknowledged with an explicit bridge note (see buildSystemAppend) instead of
 // being silently dropped on the floor.
 //
+// v36 adds `interleave` — real THINK → CARD → THINK → CARD, no DSH patch:
+//   - CORRECTS v35's closing claim. v35 said one-step-per-run was "not fixable
+//     from the plugin" because advancing the step mid-stream breaks the loop's
+//     settle. The first half is right; the conclusion was not. The plugin must
+//     never MOVE the step — but it can END THE STREAM, and the loop then opens
+//     the next step by itself. Step boundaries stay entirely the loop's.
+//   - Mechanism, all of it already present since v16: emit the echo tool-call,
+//     then stop the stream while that echo is still UNEXECUTED. The loop runs
+//     it (drawing a native card), and — because the echo no longer calls
+//     concludeTurn — it still owes a follow-up request, so it opens a fresh
+//     step and asks again. The adapter answers from the SUSPENDED generator,
+//     so the follow-up costs no second Claude Code run.
+//   - Why this fixes what v34 could not: each step settles its OWN assistant
+//     message. v34 crammed several messages into ONE step and the client
+//     replaced them all with the last. Here there is exactly one message per
+//     step, so nothing overwrites anything and prose streams normally.
+//   - Why v16/v20's "cards CANNOT appear earlier" was right AND escapable:
+//     right about one stream (tool/call is appended in executeToolCalls, after
+//     the stream ends), escapable by using MORE STREAMS. v20 measured the
+//     batching and picked fold; it never tried cutting the stream short.
+//   - Cost: one extra step per inner tool run, and a suspended run holds a
+//     live Claude Code subprocess between steps. Four paths release it —
+//     exhaustion, a non-continuation request, abort, and a 120s watchdog —
+//     because the loop can stop asking without telling the adapter.
+//   - Safe to hang the release on the abort listener: the loop reuses ONE
+//     AbortController for every step of a turn (agent.ts replaces `phase.abort`
+//     only after turn/end), so it fires on real cancellation, never between
+//     two ordinary steps.
+//   - `card` is unchanged: its echo still concludes the turn, so it keeps the
+//     documented end-of-stream batching and never spends an extra request.
+//   - Offline: probes/interleave-check.mjs (33 checks) pins the segment
+//     boundary, that SEGMENT_BREAK never escapes into the DSH stream, exact
+//     resumption, the ordering contract, fold-degradation NOT cutting a
+//     segment, and continuation detection.
+//
+// v35 turns v34's prose withholding OFF — it silently ate reasoning and text:
+//   - MEASURED, not reasoned: one turn of this session wrote 15 append-surface
+//     `assistant/message` events, ALL of them turn=1/step=1, each carrying the
+//     reasoning block that preceded a card. The transcript showed one.
+//   - Cause is in the client, not here. ui-chat's assistantDefinition keys its
+//     node by `${turn}:${step}` and its `update` does
+//     `blocks = toAssistantBlocks(message.content)` — a REPLACE. Same-step
+//     appends are read as "this one message was revised N times", so only the
+//     last one renders, and the loop's own end-of-stream settle (which carries
+//     just the tail) is what lands last. Everything before it disappears from
+//     the view while staying in the log.
+//   - Not fixable BY WITHHOLDING: the obvious fix is one step per run, but
+//     core/session's invariant makes step/start fail unless `step === nextStep`
+//     and the loop settles with the turn/step it captured BEFORE the stream
+//     (agent.ts) — advancing the step mid-stream makes that settle fail
+//     requireOpenStep and takes the whole turn down. Step boundaries are the
+//     loop's to open, and step numbers cannot be handed back.
+//     ⚠ v36 CORRECTS the conclusion drawn from this: the plugin cannot MOVE
+//     the step, but ending the stream makes the loop open the next one on its
+//     own. One step per run is reachable — see `interleave` above.
+//   - So `live` returns to v33's shape: cards append in real time, prose stays
+//     in the stream. Prose lands in the turn's single settled message, whose
+//     seq is after every card — "all cards, then all words" is the honest
+//     ordering the session model actually supports.
+//
+// v34 makes `live` interleave prose with its cards (SUPERSEDED by v35):
+//   - v33 put the cards in the log but left the words in the stream, and the
+//     loop settles a whole turn into ONE assistant message at stream end. The
+//     client sorts conversation nodes by event seq, so every card landed on one
+//     side of that single message: cards clumped, words clumped, never
+//     "words, card, words, card".
+//   - There is no fix from the stream side: StreamChunk has no message
+//     boundary (block-start/deltas/block-end/usage/finish only), so an adapter
+//     cannot make the loop settle mid-turn.
+//   - So `live` now WITHHOLDS prose from the stream and appends each run as its
+//     own `assistant/message` right before the card it introduced. DSH tolerates
+//     several assistant messages inside one open step (the session invariant
+//     only calls requireOpenStep).
+//   - The tail — prose after the last tool run — still goes through the stream:
+//     the loop settles it into the turn's assistant message, whose seq lands
+//     after every card, which is exactly where it belongs.
+//   - Accepted cost: withheld prose no longer streams token by token. It
+//     appears one run at a time, when the run it precedes completes. Only
+//     `live` with a usable sink withholds; every other mode is untouched.
+//
+// v33 adds `live` mode — native tool cards with NO DSH patch:
+//   - The client picks a tool card off two session events alone (`tool/call`
+//     and an append-surface `tool/result`); the assistant-side `tool-call`
+//     block is explicitly excluded from rendering. So instead of projecting
+//     activity into the STREAM (where `native` needs a UI patch, `fold`
+//     degrades to reasoning rows, and `card` must wait for the loop to execute
+//     an echo after the stream ends), `live` appends those two events straight
+//     into the session — the same pair the agent loop itself writes.
+//   - Result: real-time, correctly ordered, native-looking cards, on a stock
+//     dsh install, with no custom content kind to brick persistence.
+//   - The assistant `tool-call` half is NOT written: emitting one into the
+//     stream would make the loop EXECUTE the call (agent.ts executeToolCalls).
+//   - Constraint accepted: `tool/result` is a surface event, so DSH replays it
+//     into the next request's messages. Those results carry a `cc-live-` call
+//     id and are filtered out of everything fed back to Claude Code by
+//     collectEchoCallIds — Claude ran these tools itself and must not be shown
+//     orphan results for them.
+//   - turn/step are read back off the log (findOpenStep): the session
+//     invariant rejects events outside the open step, and GenerateOptions
+//     carries only `sessionId`.
+//
+// v32 stops `native` mode from poisoning persisted sessions:
+//   - dsh 0.1.5-rc.1 observes stored v0 artifacts through a strict v2→v3
+//     content-kind allowlist (text/reasoning/image/file/tool-call/tool-result).
+//     `tool-activity` is not on it, so EVERY session that ever rendered native
+//     activity cards fails to load after the upgrade ("cannot safely transform
+//     unclassified message content kind"). The append path never validated the
+//     kind, so live turns looked fine while the log became unreadable.
+//   - `native` now degrades to `fold` unless BOTH probes pass: the UI patch
+//     (rendering) AND persistence admission (migration/persistence
+//     CONTENT_KINDS accepting `tool-activity`). On a stock dsh ≥0.1.5 install
+//     native therefore always degrades.
+//   - `card` mode's own degrade was vestigial (it emits standard `tool-call`
+//     echo blocks — persistence- and UI-safe) and is removed.
+//   - Historical logs are repaired in place by dsh-patches/tool-activity/
+//     repair-sessions.mjs (tool-activity blocks → fold-equivalent reasoning
+//     blocks, original kept as *.tool-activity.bak).
+//
 // v21 adds a display-only `tool-activity` content block:
 //   - Same real-time ordering as v20 fold (emitted when each inner tool_result
 //     arrives), but the block type is NOT `reasoning` and NOT `tool-call`.
@@ -199,7 +317,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { query, createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
-import { ToolCallId, LlmError, createUserMessage, requestImageHandleText } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, LlmError, createToolResultMessage, createUserMessage, requestImageHandleText } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 
@@ -305,12 +423,22 @@ export function resolvePermissionMode(value) {
   return PERMISSION_MODES.includes(value) ? value : DEFAULTS.permissionMode
 }
 
-export const TOOL_ACTIVITY_DISPLAYS = ['native', 'fold', 'card']
+export const TOOL_ACTIVITY_DISPLAYS = ['native', 'fold', 'card', 'live', 'interleave']
+
+/**
+ * Segment boundary marker (v36, `interleave` only).
+ *
+ * NEVER reaches DSH: `pumpSegment` in the adapter consumes it, converts it to
+ * a terminal `finish`, and suspends the generator. Named with a `__` prefix so
+ * a stray one would fail the LLM stream grammar loudly (invariant.ts rejects
+ * unknown chunk types) instead of being silently dropped.
+ */
+export const SEGMENT_BREAK = '__cc-segment-break'
 
 /**
  * Whether the tool-activity UI patch is present in the DSH install.
  *
- * `card` mode emits a custom content block that only a PATCHED DSH renders;
+ * `native` mode emits a custom content block that only a PATCHED DSH renders;
  * against an unpatched install the trajectory panel throws a TypeError. The
  * patch lives inside DSH's own bundle files, so a published package cannot
  * carry it and every DSH upgrade wipes it — see dsh-patches/tool-activity/.
@@ -349,27 +477,88 @@ export function resetToolActivityPatchProbe() {
 }
 
 /**
- * Fall back to `fold` when `card` was asked for but the UI patch is absent.
+ * Whether the installed dsh PERSISTENCE layer admits `tool-activity` content
+ * blocks (v32).
  *
- * `fold` is the closest survivor: it is the other real-time projection and
- * needs no patch. Warns once — this is a deployment fact, not a per-turn one,
- * and repeating it every turn would be noise.
+ * The UI probe above governs rendering; this one governs whether the block
+ * can reach disk without bricking the session. dsh 0.1.5-rc.1 enforces a
+ * strict content-kind allowlist both in the v2→v3 format migration
+ * (dsh-session-format-v2-to-v3) and the JSONL persistence worker when a
+ * stored artifact is observed — an unknown kind makes the whole session fail
+ * to load, while the append path stays permissive, so nothing looks wrong
+ * until a cold read. Both bundles build CONTENT_KINDS from a literal; stock
+ * dsh names only text/reasoning/image/file/tool-call/tool-result.
+ *
+ * Three-valued like the UI probe: `'unknown'` must not degrade anything.
+ * Cached for the same reason.
+ */
+let toolActivityPersistenceState
+
+export function toolActivityPersistencePresent() {
+  if (toolActivityPersistenceState !== undefined) return toolActivityPersistenceState
+  try {
+    const require = createRequire(import.meta.url)
+    // Same internal-root walk-up as the UI probe above: the session-format
+    // packages sit beside dsh-llm under dsh's own @deepseek-ai directory.
+    const anchor = require.resolve('@deepseek-ai/dsh-llm/package.json')
+    const root = join(anchor, '..', '..')
+    const sources = [
+      join(root, 'dsh-session-format-v2-to-v3/lib/index.js'),
+      join(root, 'dsh-session-persistence-jsonl/lib/worker.cjs'),
+    ].map((path) => readFileSync(path, 'utf8'))
+    // Admission means the allowlist literal itself names the kind.
+    toolActivityPersistenceState = sources.every((source) => /CONTENT_KINDS[^)]*"tool-activity"/.test(source))
+  } catch {
+    toolActivityPersistenceState = 'unknown'
+  }
+  return toolActivityPersistenceState
+}
+
+/** Reset the cached probe. Tests only. */
+export function resetToolActivityPersistenceProbe() {
+  toolActivityPersistenceState = undefined
+}
+
+/**
+ * Degrade `native` to `fold` when the install cannot safely carry its blocks.
+ *
+ * v32: `native` is the only mode that persists a custom `tool-activity`
+ * content block. It needs BOTH the UI patch (or the trajectory panel throws
+ * on the unknown block) AND persistence admission (or dsh ≥0.1.5-rc.1 refuses
+ * to load the session afterwards — see repair-sessions.mjs). `fold` is the
+ * closest survivor: the other real-time projection, plain `reasoning` blocks
+ * that every layer accepts. `card` needs no conditions: its echo blocks are
+ * standard `tool-call`s (the pre-v32 card degrade was vestigial). `live` needs
+ * none either, and for a stronger reason: it emits no custom block at all,
+ * only the two standard session events the loop itself writes (v33).
+ *
+ * Warns once — this is a deployment fact, not a per-turn one.
  * @param display - already normalised display mode.
  * @param logger - optional ctx.logger.
- * @param present - probe result; injectable so the degrade branch is testable
- *   on a machine where the patch IS applied.
+ * @param present - UI probe result; injectable so the degrade branch is
+ *   testable on a machine where the patch IS applied.
+ * @param persist - persistence probe result; injectable likewise.
  * @returns the display mode to actually use.
  */
 let toolActivityDegradeWarned = false
 
-export function degradeToolActivityDisplay(display, logger, present = toolActivityPatchPresent()) {
-  if (display !== 'card') return display
-  if (present !== false) return display
+export function degradeToolActivityDisplay(
+  display,
+  logger,
+  present = toolActivityPatchPresent(),
+  persist = toolActivityPersistencePresent(),
+) {
+  if (display !== 'native') return display
+  if (present !== false && persist !== false) return display
   if (!toolActivityDegradeWarned) {
     toolActivityDegradeWarned = true
+    const reasons = [
+      present === false ? '界面补丁未打（轨迹面板不认识该块）' : null,
+      persist === false ? '持久化层白名单不收 tool-activity（会话冷读会失败，dsh ≥0.1.5-rc.1）' : null,
+    ].filter(Boolean).join('；')
     logger?.warn?.(
-      'toolActivityDisplay=card 需要 DSH 界面补丁，当前安装未打补丁（轨迹面板会抛 TypeError），'
-      + '已自动回退到 fold。要启用卡片：node dsh-patches/tool-activity/apply.mjs，然后重启 dsh web。',
+      `toolActivityDisplay=native 在当前 DSH 安装上不可用（${reasons}），已自动回退到 fold。`
+        + '历史受污染会话可用 dsh-patches/tool-activity/repair-sessions.mjs 修复。',
     )
   }
   return 'fold'
@@ -495,7 +684,28 @@ export function buildMirrorUserEvent({ text, id, senderSessionId }) {
   }, MIRROR_SURFACE]
 }
 
-/** One mirrored assistant message (reasoning / text / tool-call blocks). */
+/**
+ * One mirrored assistant message (reasoning / text / tool-call blocks).
+ *
+ * Trap 4: `stream` is MANDATORY and neither layer that writes tells you so.
+ * dsh's own loop settles every `assistant/message` with `stream: live.stream`
+ * (four call sites in dsh-agent-loop, no exception), and two consumers assume
+ * it is always an array:
+ *   - restore validation (`assertAssistantSettlementShape` in dsh-session)
+ *     rejects the whole log with "invalid settlement fields" — the session
+ *     reads as CORRUPT once it goes cold;
+ *   - the token meter's `usageOf` calls `lastAssistantStreamChunk(stream, …)`,
+ *     which does `stream.length - 1` — so while the session is still HOT the
+ *     projection fold throws a bare TypeError ("Cannot read properties of
+ *     undefined (reading 'length')") that the gateway reports as
+ *     `gateway/internal` and the UI shows as "历史加载失败".
+ * `session.append` validates none of this, so a missing `stream` looks fine
+ * for an entire turn and only surfaces when someone loads the history.
+ *
+ * `[]` is the correct value here, not a placeholder: a mirrored message is not
+ * an LLM settlement, so it carries no stream records and must contribute no
+ * usage. The blocks live in `message.content`, which is what renders.
+ */
 export function buildMirrorAssistantEvent({ turn = 1, step = 1, content, id, provider = 'claude-code', model }) {
   return ['assistant/message', {
     turn,
@@ -507,6 +717,7 @@ export function buildMirrorAssistantEvent({ turn = 1, step = 1, content, id, pro
       source: { kind: 'model', provider, ...model === undefined ? {} : { model } },
       content: Array.isArray(content) ? content : [],
     },
+    stream: [],
   }, MIRROR_SURFACE]
 }
 
@@ -1338,13 +1549,54 @@ export function isEchoCallBlock(block) {
   }
 }
 
-/** Every echoed call id in a message list (result blocks reference these). */
+/**
+ * Call-id prefix for `live` mode's display-only tool events (v33).
+ *
+ * `live` writes its `tool/call` straight to the session log, so — unlike an
+ * echo — there is NO assistant tool-call block carrying {@link ECHO_MARKER} to
+ * recognise the pair by. The id itself is the marker, and it has to be one:
+ * `tool/result` is a surface event (`SURFACE_EVENT_TYPES` in DSH's
+ * session/surface.ts), so DSH replays these results into the next request's
+ * messages whether we want them or not. Every consumer that must not feed them
+ * back to Claude recognises them through {@link collectEchoCallIds}.
+ */
+const LIVE_CALL_PREFIX = 'cc-live-'
+
+/** Whether a call id belongs to a `live`-mode display-only tool event. */
+export function isLiveActivityCallId(id) {
+  return typeof id === 'string' && id.startsWith(LIVE_CALL_PREFIX)
+}
+
+/** A fresh display-only call id for one `live` tool run. */
+export function newLiveActivityCallId() {
+  return `${LIVE_CALL_PREFIX}${randomUUID()}`
+}
+
+/**
+ * Every display-only call id in a message list (result blocks reference these).
+ *
+ * Two shapes land here, and both must be filtered out of anything replayed to
+ * Claude Code — it ran these tools itself, so feeding its own results back is
+ * at best duplication and at worst an orphan tool result the route rejects:
+ *   - `card` echoes: an assistant tool-call block marked with ECHO_MARKER.
+ *   - `live` events: a user-role tool-result whose callId carries
+ *     {@link LIVE_CALL_PREFIX}. There is no assistant block to inspect, by
+ *     design (emitting one would make the agent loop EXECUTE the call).
+ * Returning both through one set keeps every existing call site — replay
+ * planning, transcript serialisation, the resume watermark — unchanged.
+ */
 export function collectEchoCallIds(messages) {
   const ids = new Set()
   for (const message of messages ?? []) {
-    if (message?.role !== 'assistant') continue
+    if (message?.role === 'assistant') {
+      for (const block of message.content ?? []) {
+        if (isEchoCallBlock(block) && typeof block?.id === 'string') ids.add(block.id)
+      }
+      continue
+    }
+    if (message?.role !== 'user') continue
     for (const block of message.content ?? []) {
-      if (isEchoCallBlock(block) && typeof block?.id === 'string') ids.add(block.id)
+      if (block?.type === 'tool-result' && isLiveActivityCallId(block.toolCallId)) ids.add(block.toolCallId)
     }
   }
   return ids
@@ -1357,7 +1609,184 @@ export function isEchoOnlyUserMessage(message, echoIds) {
   return content.length > 0 && content.every((block) => block?.type === 'tool-result' && echoIds.has(block.toolCallId))
 }
 
-export async function* translateSdkMessages(messages, { showToolActivity = true, toolActivityDisplay = DEFAULTS.toolActivityDisplay, toolResultDisplayChars = DEFAULTS.toolResultDisplayChars, echoNameOf = () => ECHO_FALLBACK, onResult, mirror } = {}) {
+/**
+ * Whether this request is DSH coming back for the NEXT interleave segment
+ * (v36), rather than a genuinely new turn.
+ *
+ * The signal is the last message: after the loop executes a segment's echo it
+ * re-requests with that echo's tool-result appended, and an echo result is the
+ * ONLY thing in that message. A real user message, steering, or a normal tool
+ * result all fail this test — so a stale suspended generator can never hijack
+ * fresh input.
+ */
+export function isEchoContinuation(messages) {
+  const list = messages ?? []
+  const last = list[list.length - 1]
+  if (last === undefined) return false
+  return isEchoOnlyUserMessage(last, collectEchoCallIds(list))
+}
+
+/**
+ * Drain ONE interleave segment from a (possibly suspended) translateSdkMessages.
+ *
+ * Returns `true` when the generator ran out — this was the turn's last segment
+ * and its resources must be released. Returns `false` when it stopped at a
+ * {@link SEGMENT_BREAK}: the generator is SUSPENDED mid-stream, still holding
+ * the live Claude Code query, and must be kept alive for the next DSH step.
+ *
+ * The break is converted to a terminal `finish` rather than forwarded: DSH's
+ * stream grammar knows nothing about segments, and the assistant message this
+ * finish settles still carries the unexecuted echo tool-call, which is what
+ * makes the loop run it and open the next step.
+ */
+export async function* pumpSegment(gen) {
+  for (;;) {
+    const next = await gen.next()
+    if (next.done === true) return true
+    const chunk = next.value
+    if (chunk?.type === SEGMENT_BREAK) {
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return false
+    }
+    yield chunk
+  }
+}
+
+/**
+ * The turn/step the outer loop currently has OPEN, or undefined when none is.
+ *
+ * `live` mode appends into a session another plugin is driving, and DSH's
+ * session invariant (core/session/src/invariant.ts, `requireOpenStep`) rejects
+ * a `tool/call` or `tool/result` whose turn/step is not the open one. The loop
+ * does not hand the adapter its step — `GenerateOptions` carries only
+ * `sessionId` — so it has to be read back off the log.
+ *
+ * Scans BACKWARDS and stops at the first step boundary: whichever of
+ * `step/start` / `step/end` comes last decides, and it is always near the tail,
+ * so this never walks the whole log.
+ * @param session - the live DSH session.
+ * @returns `{ turn, step }` of the open step, or undefined.
+ */
+export function findOpenStep(session) {
+  const events = session?.snapshotEvents?.() ?? []
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type === 'step/end') return undefined
+    if (event?.type === 'step/start') {
+      const { turn, step } = event.data ?? {}
+      return typeof turn === 'number' && typeof step === 'number' ? { turn, step } : undefined
+    }
+  }
+  return undefined
+}
+
+/**
+ * Claude Code tool name → the DSH wire name that picks the card (v33).
+ *
+ * The client keys its rich tool views off the wire name alone
+ * (`tool.call.toolview` slot key, and `TOOL_VARIANTS` for the generic row), so
+ * this map is what turns a run into a read row, a bash row or a diff row
+ * instead of the unclassified `others` row. Same table `card` mode uses, for
+ * the same reason.
+ *
+ * An unmapped name is passed through UNCHANGED rather than forced onto a
+ * fallback: an honest tool name on a generic row beats a wrong card.
+ */
+export function liveWireToolName(ccName) {
+  return ECHO_VARIANTS[ccName] ?? ccName
+}
+
+/**
+ * Write one completed inner tool run into the session as a native tool card.
+ *
+ * This is `live` mode's whole mechanism, and it is deliberately NOT a stream
+ * projection: it appends the same two events the official agent loop writes
+ * when it runs a tool, so the transcript and the Trajectory panel render their
+ * ordinary cards, in real time, with no DSH patch and no custom content kind.
+ *
+ *   tool/call    no SurfaceIntent — not a surface event, never reaches the model
+ *   tool/result  surfaceOp 'append', citing the call's seq (DSH requires both)
+ *
+ * The assistant-side `tool-call` block the loop normally writes is omitted ON
+ * PURPOSE: the client excludes it from rendering anyway, and emitting one into
+ * the stream would make the loop EXECUTE the call.
+ *
+ * Never throws: display is a side view, and a failed card must not take the
+ * turn down with it.
+ * @param session - the live session to append into.
+ * @param logger - optional ctx.logger for the one-time failure notice.
+ * @param model - optional model name recorded on appended prose messages.
+ * @returns a sink `{ prose, tool }`, or undefined when the session is unusable.
+ */
+export function createLiveActivitySink({ session, logger, model }) {
+  if (session === undefined || typeof session.append !== 'function') return undefined
+  // Resolved once, not per call: the adapter's whole stream runs inside ONE
+  // loop step, so the open turn/step cannot change underneath it.
+  let location
+  let resolved = false
+  let warned = false
+  const warn = (what, error) => {
+    if (warned) return
+    warned = true
+    logger?.warn?.(`llm-claude-code: live tool card ${what} failed (${error?.message ?? error}); activity is hidden for this turn`)
+  }
+  const place = () => {
+    if (!resolved) {
+      resolved = true
+      location = findOpenStep(session)
+    }
+    return location
+  }
+  /**
+   * One withheld prose run, appended as its own assistant message (v34).
+   *
+   * The client sorts conversation nodes by event seq, and the loop settles the
+   * whole turn into ONE assistant message at stream end — so prose left in the
+   * stream can never sit between two cards. Writing each run here is what makes
+   * the transcript read "words, card, words, card" instead of "all cards, then
+   * all words". DSH tolerates several assistant messages inside one open step
+   * (core/session invariant only calls requireOpenStep).
+   */
+  const prose = (blocks) => {
+    if (!Array.isArray(blocks) || blocks.length === 0) return
+    try {
+      const at = place()
+      if (at === undefined) return warn('placement', new Error('no open step in the session log'))
+      appendMirrorEvent(session, buildMirrorAssistantEvent({ turn: at.turn, step: at.step, content: blocks, model }))
+    } catch (error) {
+      warn('prose append', error)
+    }
+  }
+  const tool = (use, output, isError) => {
+    try {
+      const location = place()
+      if (location === undefined) return warn('placement', new Error('no open step in the session log'))
+      const callId = newLiveActivityCallId()
+      const input = use?.input ?? {}
+      const callSeq = session.append('tool/call', {
+        turn: location.turn,
+        step: location.step,
+        callId,
+        name: liveWireToolName(bridgeDisplayName(use?.name ?? 'tool')),
+        arguments: typeof input === 'string' ? input : JSON.stringify(input),
+      }).seq
+      session.append('tool/result', {
+        turn: location.turn,
+        step: location.step,
+        message: createToolResultMessage({
+          callId,
+          content: [{ type: 'text', text: typeof output === 'string' && output.length > 0 ? output : '(no output)' }],
+          isError: isError === true,
+        }),
+      }, { surfaceOp: 'append', sourceEventSeqs: [callSeq] })
+    } catch (error) {
+      warn('append', error)
+    }
+  }
+  return { prose, tool }
+}
+
+export async function* translateSdkMessages(messages, { showToolActivity = true, toolActivityDisplay = DEFAULTS.toolActivityDisplay, toolResultDisplayChars = DEFAULTS.toolResultDisplayChars, echoNameOf = () => ECHO_FALLBACK, onResult, mirror, activitySink, segmented = false } = {}) {
   // native/fold are order-preserving. card still batches after the outer stream.
   // Unknown values clamp to native so a typo cannot silently restore batched cards.
   const activityDisplay = resolveToolActivityDisplay(toolActivityDisplay)
@@ -1366,6 +1795,15 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
   const useOf = (id) => toolUses.get(id)
   let nextIndex = 0
   let emittedText = false
+  // v35 forces this OFF — see the file header. v34 set it for `live` to
+  // interleave prose with cards; the client collapses every same-step
+  // assistant/message into ONE node (blocks are REPLACED, not appended), so
+  // each withheld run overwrote the previous one and only the final settle
+  // survived. Withholding is kept as a switch rather than deleted because the
+  // machinery below is what a future interleave attempt would reuse, but
+  // nothing may turn it back on without a client that appends.
+  const withholdProse = false
+  const pendingProse = []
   let result
   let lastPromptUsage
 
@@ -1446,9 +1884,11 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
         const native = event.content_block
         const kind = native?.type === 'text' ? 'text' : native?.type === 'thinking' || native?.type === 'redacted_thinking' ? 'reasoning' : undefined
         if (kind !== undefined) {
-          const state = { index: nextIndex++, kind, text: '' }
+          // A withheld block must NOT consume a stream index: the assembler
+          // keys blocks by index, and skipping one would leave a hole.
+          const state = { index: withholdProse ? -1 : nextIndex++, kind, text: '' }
           blocks.set(event.index, state)
-          yield { type: 'block-start', index: state.index, blockType: kind }
+          if (!withholdProse) yield { type: 'block-start', index: state.index, blockType: kind }
         }
       } else if (event?.type === 'content_block_delta') {
         const state = blocks.get(event.index)
@@ -1457,11 +1897,13 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
           const text = state.kind === 'text' ? delta?.text : delta?.thinking
           if (typeof text === 'string' && text.length > 0) {
             state.text += text
-            if (state.kind === 'text') {
-              emittedText = true
-              yield { type: 'text-delta', index: state.index, text }
-            } else {
-              yield { type: 'reasoning-delta', index: state.index, text }
+            // Tracked even when withheld: the result.result fallback must not
+            // re-emit an answer this turn already produced.
+            if (state.kind === 'text') emittedText = true
+            if (!withholdProse) {
+              yield state.kind === 'text'
+                ? { type: 'text-delta', index: state.index, text }
+                : { type: 'reasoning-delta', index: state.index, text }
             }
           }
         }
@@ -1469,11 +1911,9 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
         const state = blocks.get(event.index)
         if (state !== undefined) {
           blocks.delete(event.index)
-          yield {
-            type: 'block-end',
-            index: state.index,
-            block: state.kind === 'text' ? { type: 'text', text: state.text } : { type: 'reasoning', text: state.text },
-          }
+          const block = state.kind === 'text' ? { type: 'text', text: state.text } : { type: 'reasoning', text: state.text }
+          if (withholdProse) pendingProse.push(block)
+          else yield { type: 'block-end', index: state.index, block }
         }
       }
       continue
@@ -1501,7 +1941,24 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
         ? message.message.content.filter((block) => block?.type === 'tool_result')
         : []
       if (results.length > 0) {
-        if (activityDisplay === 'fold') {
+        if (activityDisplay === 'live') {
+          // Nothing is yielded: the card is written straight into the session
+          // log by the sink. A missing sink (no live session) degrades to a
+          // fold so the run is still visible rather than silently lost.
+          for (const block of results) {
+            const use = useOf(block?.tool_use_id)
+            if (use === undefined) continue
+            const text = resultText(block?.content, toolResultDisplayChars)
+            if (activitySink === undefined) {
+              yield* emitFoldBlock(describeToolActivityFolds([block], useOf, toolResultDisplayChars)[0])
+            } else {
+              // Words first, then the card they introduced: the client sorts by
+              // event seq, so flushing here is what produces the interleaving.
+              if (pendingProse.length > 0) activitySink.prose(pendingProse.splice(0))
+              activitySink.tool(use, text, block?.is_error === true)
+            }
+          }
+        } else if (activityDisplay === 'fold') {
           for (const fold of describeToolActivityFolds(results, useOf, toolResultDisplayChars)) {
             yield* emitFoldBlock(fold)
           }
@@ -1525,6 +1982,20 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
               yield* emitFoldBlock(describeToolActivityFolds([block], useOf, toolResultDisplayChars)[0])
             } else {
               yield* emitActivityCardChunk(use, echoName, resultText(block?.content, toolResultDisplayChars) || '(no output)', block?.is_error === true)
+              // v36 `interleave`: cut the stream HERE. DSH appends tool/call
+              // only in executeToolCalls, i.e. after a stream ends — so one
+              // stream can never show a card before its own later prose. The
+              // way out is more STEPS, not an earlier card: end this stream
+              // holding an unexecuted echo, and the loop runs it, draws the
+              // card, and opens a fresh step whose assistant message carries
+              // the next prose. Each step owns its own message, so nothing
+              // overwrites anything (contrast v34, which faked several
+              // messages inside ONE step and lost all but the last).
+              //
+              // Only legal while the echo does NOT concludeTurn — see
+              // defineEchoTool. A `card`-mode echo still concludes, so `card`
+              // keeps its documented end-of-stream batching.
+              if (segmented) yield { type: SEGMENT_BREAK }
             }
           }
         }
@@ -1537,6 +2008,14 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
 
   if (result === undefined) throw new LlmError('llm-claude-code: SDK ended without a result', 'EMPTY_RESPONSE')
   if (result.subtype !== 'success' || result.is_error) throw sdkFailure(result)
+  // The tail — prose after the LAST tool run — goes through the stream on
+  // purpose: the loop settles it into this turn's assistant message, whose seq
+  // lands after every card, which is exactly where it belongs. Emitted whole
+  // because it was withheld rather than streamed. Flushed after the failure
+  // checks so a broken turn does not leave half an answer behind.
+  for (const block of pendingProse.splice(0)) {
+    yield* block.type === 'text' ? emitTextBlock(block.text) : emitFoldBlock(block.text)
+  }
   if (!emittedText && typeof result.result === 'string' && result.result.length > 0) {
     const index = nextIndex++
     yield { type: 'block-start', index, blockType: 'text' }
@@ -2133,8 +2612,9 @@ export function apply(ctx, rawConfig = {}) {
     return {
       ...merged,
       permissionMode: resolvePermissionMode(merged.permissionMode),
-      // Degrade AFTER normalising: `card` is an explicit opt-in, and an
-      // unpatched DSH would crash its trajectory panel on the custom block.
+      // Degrade AFTER normalising: `native` is the default, and it is the one
+      // mode whose blocks need a patched UI AND an admitting persistence
+      // layer — see degradeToolActivityDisplay (v32).
       toolActivityDisplay: degradeToolActivityDisplay(
         resolveToolActivityDisplay(merged.toolActivityDisplay),
         ctx.logger,
@@ -2151,6 +2631,16 @@ export function apply(ctx, rawConfig = {}) {
   // { claudeSessionId, lastFedMessageId }. In-memory only — a host restart
   // simply falls back to one full-replay turn and re-seeds the entry.
   const resumeState = new Map()
+  // v36 `interleave`: dsh session key → the SUSPENDED run that owes more
+  // segments. Holds the half-consumed translateSdkMessages generator, the live
+  // Claude Code query behind it, and that attempt's mirror driver.
+  //
+  // Every entry is a live subprocess, so nothing may leak one: `settle()` is
+  // idempotent and runs on exhaustion, on a non-continuation request, on
+  // abort, and on a watchdog timeout (the loop can stop asking for segments
+  // without telling the adapter — an error between steps, or a user interrupt).
+  const interleaveState = new Map()
+  const SEGMENT_WATCHDOG_MS = 120000
   const userQuestions = ctx.get('userQuestions')
   const agents = ctx.get('agents')
   const askUserQuestion = (input, sdkOptions) => askUserQuestionThroughDsh(input, {
@@ -2254,7 +2744,15 @@ export function apply(ctx, rawConfig = {}) {
     isConcurrencySafe: () => true,
     timeoutMs: 5000,
     async execute(args, exec) {
-      exec.concludeTurn()
+      // v36: `interleave` depends on the loop opening ANOTHER step after this
+      // card, and NOT concluding is precisely what owes it that follow-up
+      // request (DSH loop.spec.ts: "a tool can conclude the turn despite owing
+      // a follow-up request"). The adapter answers that request from the
+      // SUSPENDED generator, so the follow-up costs no extra Claude Code run.
+      //
+      // Every other mode keeps v16's conclude: there the echo is the last
+      // thing in the turn and a follow-up would be a wasted model call.
+      if (resolveToolActivityDisplay(config().toolActivityDisplay) !== 'interleave') exec.concludeTurn()
       return { recorded: true }
     },
   })
@@ -2316,10 +2814,46 @@ export function apply(ctx, rawConfig = {}) {
       }
     },
     async *stream(options) {
-      if (options.signal?.aborted) throw new LlmError('llm-claude-code: request aborted', 'ABORTED')
-
       const resolved = config()
       const sessionKey = typeof options.sessionId === 'string' && options.sessionId.length > 0 ? options.sessionId : 'default'
+      const interleaving = resolveToolActivityDisplay(resolved.toolActivityDisplay) === 'interleave'
+
+      // ── v36 `interleave`: serve the NEXT segment of a suspended run ───────
+      //
+      // The loop just executed the previous segment's echo, drew its card, and
+      // opened a fresh step. Answering it from the suspended generator is what
+      // makes the next prose land in a NEW assistant message — interleaved and
+      // whole — instead of overwriting the previous one.
+      //
+      // Ordered before the abort check on purpose: a suspended run owns a live
+      // Claude Code subprocess, and returning early without settling it would
+      // leak that process for the watchdog to reap minutes later.
+      const carried = interleaveState.get(sessionKey)
+      if (carried !== undefined) {
+        interleaveState.delete(sessionKey)
+        carried.disarm()
+        // Resumable only for the exact request it was suspended for. A new
+        // user message, a mode switched away from interleave, or an abort all
+        // mean its remaining segments would answer a question nobody asked.
+        if (interleaving && options.signal?.aborted !== true && isEchoContinuation(options.messages)) {
+          let exhausted = true
+          try {
+            exhausted = yield* pumpSegment(carried.gen)
+          } catch (error) {
+            carried.settle()
+            throw error instanceof LlmError
+              ? error
+              : new LlmError(`llm-claude-code: ${error?.message ?? error}`, 'PROVIDER_ERROR')
+          }
+          if (exhausted) carried.settle()
+          else carried.arm()
+          return
+        }
+        carried.settle()
+      }
+
+      if (options.signal?.aborted) throw new LlmError('llm-claude-code: request aborted', 'ABORTED')
+
       const plan = resolved.nativeResume
         ? planReplay(options.messages, resumeState.get(sessionKey), 'claude-code-main')
         : { mode: 'full' }
@@ -2333,7 +2867,21 @@ export function apply(ctx, rawConfig = {}) {
         ? resolved.binary
         : await ctx.subprocess.resolveExecutable('claude', {}, options.signal)
       const controller = new AbortController()
-      const onAbort = () => controller.abort(options.signal?.reason)
+      const onAbort = () => {
+        controller.abort(options.signal?.reason)
+        // v36: a suspended interleave run outlives the stream() call that
+        // created it, so this listener is the last reference able to release
+        // it. Safe to hang the release here because the loop reuses ONE
+        // AbortController for every step of a turn (agent.ts: `phase.abort` is
+        // replaced only after turn/end), so this fires on a real cancellation
+        // — never between two ordinary steps of the same turn.
+        const suspendedRun = interleaveState.get(sessionKey)
+        if (suspendedRun !== undefined) {
+          interleaveState.delete(sessionKey)
+          suspendedRun.disarm()
+          suspendedRun.settle()
+        }
+      }
       options.signal?.addEventListener('abort', onAbort, { once: true })
       const effort = options.reasoningEffort === undefined ? 'high' : String(options.reasoningEffort)
       // DSH plan mode / read-only preset must reach the SDK as a real
@@ -2499,9 +3047,37 @@ export function apply(ctx, rawConfig = {}) {
             model: options.model,
           })
           : undefined
+        // `live` writes its cards into THIS session's log, so it needs the live
+        // Session object. Resolved per attempt (a resume retry re-enters here)
+        // and left undefined for every other mode, which touches no session.
+        const activitySink = resolveToolActivityDisplay(resolved.toolActivityDisplay) === 'live'
+          && typeof options.sessionId === 'string' && options.sessionId.length > 0
+          ? createLiveActivitySink({ session: sessions.get(options.sessionId), logger, model: options.model })
+          : undefined
+        // One idempotent release for this attempt. `finally` runs it on every
+        // ordinary exit; an interleave SUSPENSION hands it to the carrier
+        // instead, which runs it once the last segment drains — or when the
+        // watchdog or an abort gives up on the run.
+        let released = false
+        const releaseAttempt = () => {
+          if (released) return
+          released = true
+          options.signal?.removeEventListener('abort', onAbort)
+          sdkQuery.close()
+          // Synchronous, and contains every failure itself: an abort still
+          // closes the children's open turns, and throwing here would replace
+          // the turn's real error with a mirroring one. Durability is the
+          // persistence coordinator's job, so there is nothing to await.
+          if (mirror !== undefined) {
+            const opened = mirror.settle()
+            if (opened > 0) logger.info('llm-claude-code: mirrored %d Task subagent(s): %s', opened, mirror.childIds().join(' '))
+          }
+        }
+        let suspended = false
         try {
-          yield* translateSdkMessages(sdkQuery, {
+          const segments = translateSdkMessages(sdkQuery, {
             mirror: mirror?.observe,
+            activitySink,
             showToolActivity: resolved.showToolActivity,
             toolActivityDisplay: resolveToolActivityDisplay(resolved.toolActivityDisplay),
             toolResultDisplayChars: resolved.toolResultDisplayChars,
@@ -2520,7 +3096,41 @@ export function apply(ctx, rawConfig = {}) {
                 if (lastUser?.id !== undefined) resumeState.set(sessionKey, { claudeSessionId: result.session_id, lastFedMessageId: lastUser.id, cwd: workspace })
               }
             },
+            segmented: interleaving,
           })
+          if (!interleaving) {
+            yield* segments
+            return
+          }
+          // Exhausted on the first pass = the inner run made no tool calls at
+          // all, so there was never anything to interleave.
+          if (yield* pumpSegment(segments)) return
+          // Suspended mid-stream. Hold the half-consumed generator — and the
+          // live Claude Code query behind it — for the next step's request.
+          // The watchdog is the only guard against a step that never comes:
+          // the loop can stop asking without telling the adapter.
+          suspended = true
+          let timer = null
+          const entry = {
+            gen: segments,
+            settle: releaseAttempt,
+            disarm() {
+              if (timer === null) return
+              clearTimeout(timer)
+              timer = null
+            },
+            arm() {
+              entry.disarm()
+              timer = setTimeout(() => {
+                if (interleaveState.get(sessionKey) === entry) interleaveState.delete(sessionKey)
+                logger.warn('llm-claude-code: interleave run was never resumed; releasing its Claude Code process')
+                releaseAttempt()
+              }, SEGMENT_WATCHDOG_MS)
+              timer.unref?.()
+              interleaveState.set(sessionKey, entry)
+            },
+          }
+          entry.arm()
           return
         } catch (error) {
           const message = error instanceof LlmError ? error.message : String(error?.message ?? error)
@@ -2536,16 +3146,9 @@ export function apply(ctx, rawConfig = {}) {
           const detail = spawnFailureOf() !== null ? ` [claude spawn: ${spawnFailureOf()}]` : ''
           throw new LlmError(`llm-claude-code: ${error?.message ?? error}${detail}`, error?.code === 'MAX_TOKENS' ? 'MAX_TOKENS' : 'PROVIDER_ERROR')
         } finally {
-          options.signal?.removeEventListener('abort', onAbort)
-          sdkQuery.close()
-          // Synchronous, and contains every failure itself: an abort still
-          // closes the children's open turns, and throwing here would replace
-          // the turn's real error with a mirroring one. Durability is the
-          // persistence coordinator's job, so there is nothing to await.
-          if (mirror !== undefined) {
-            const opened = mirror.settle()
-            if (opened > 0) logger.info('llm-claude-code: mirrored %d Task subagent(s): %s', opened, mirror.childIds().join(' '))
-          }
+          // A suspended interleave run owns its own release (entry.settle), so
+          // closing here would kill the query the next segment still needs.
+          if (!suspended) releaseAttempt()
         }
       }
     },

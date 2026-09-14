@@ -384,7 +384,16 @@ if (sdkSrc !== undefined) {
 
 // ---------------------------------------------------------------- ui patches
 // These four live INSIDE the DSH install, so an upgrade always wipes them.
+// Only `native` needs them: `live` writes standard tool/call + tool/result
+// events that stock DSH renders, and `fold`/`card` reuse existing block paths.
+// Reporting a missing patch under those modes is a false alarm, so the section
+// is skipped entirely — a checkup that cries wolf stops being read.
+const SETTINGS = readIf(join(process.env.HOME ?? '', '.dsh/settings.yaml')) ?? ''
+const CONFIGURED_DISPLAY = (/^\s*toolActivityDisplay:\s*['"]?([a-z]+)/m.exec(SETTINGS)?.[1]) ?? 'native'
 heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
+if (CONFIGURED_DISPLAY !== 'native') {
+  console.log(`  SKIP  toolActivityDisplay 配的是 \`${CONFIGURED_DISPLAY}\`，该模式不依赖界面补丁`)
+}
 const MARKER = 'tool-activity'
 // 0.1.2-rc.1 起 dsh-client-runtime 包被上游删除（be531688f3），分类器被内联进
 // 每个消费者 bundle：chat 一份、trajectory 一份，两份都得打；卡片也从
@@ -394,7 +403,7 @@ const UI_TARGETS = [
   ['dsh-llm/lib/index.js', '中断后已完成的工具卡丢失'],
   ['dsh-client-ui-trajectory/lib/client.js', '轨迹面板崩溃（TypeError）'],
 ]
-for (const [rel, impact] of UI_TARGETS) {
+for (const [rel, impact] of CONFIGURED_DISPLAY === 'native' ? UI_TARGETS : []) {
   const src = readIf(join(ROOT, rel))
   const hits = src === undefined ? 0 : src.split(MARKER).length - 1
   check('ui', `${basename(dirname(dirname(rel)))} 补丁在位`, hits > 0,

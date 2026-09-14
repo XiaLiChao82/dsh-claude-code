@@ -33,9 +33,38 @@ dsh --profile headless --patch probes/driver-read.patch.yml exec "noop"
 
 覆盖四条路径：真实录制流（`../fixtures/subagent-stream.json`）走完整生命周期，另三条合成流补真实录制覆盖不到的失败收尾与中断收尾。
 
+## settlement 探针：`live` 模式写进主会话的事件形状
+
+```bash
+cd llm-claude-code
+dsh --profile headless --patch probes/settlement.patch.yml exec "noop"
+#   期望 RESULT=SETTLEMENT_OK
+#   两组都必须「符合预期」：GOOD 过、CANARY 抛错
+```
+
+单进程跑完，不需要分两阶段——这一层是 projection fold，不是冷读。
+
+与 driver-probe 的分工：driver-probe 验**子会话**（镜像出来的那个），
+settlement 验 `live` 模式（v33/v34）直接 append 进**父会话**的那三种事件
+（`assistant/message` / `tool/call` / `tool/result`）。后者在 2026-09-14 之前
+没有任何探针覆盖，于是 `buildMirrorAssistantEvent` 缺 `stream` 字段这个缺陷
+一路通到了界面上：会话热着时 token-meter 的 `usageOf` → `lastAssistantStreamChunk`
+里 `stream.length - 1` 抛 TypeError，网关兜底成 `gateway/internal`，显示
+「历史加载失败：Cannot read properties of undefined (reading 'length')」；
+会话冷了之后 restore 的 `assertAssistantSettlementShape` 直接判整个日志损坏。
+同一个根因两副面孔，写入层（`session.append`）全程不报错。
+
+**CANARY 组不是凑数的。** 它故意把 `stream` 删掉，必须失败；GOOD 过而 CANARY
+也过，说明这一层压根没在校验，探针已经瞎了。第一版就是这么瞎的：`inject` 只列了
+`sessions` + `sessionProjections`，注册的 projection 单元为空，`snapshot()`
+什么都不折叠，两组于是一起「通过」。所以探针还有一条自检——折叠单元数为 0
+直接判失败。**改 inject 或换 profile 之后，先确认自检那行仍然是非 0。**
+
 ## 跑完要清理
 
 探针会在 `~/.dsh/sessions/<工作区>/` 下留四个真实子会话。id 在阶段一的 `childIds` 里，也存在 `driver-probe-ids.json`（gitignore，两阶段之间的中间文件）。留着无害，但会混在真实会话里。
+
+settlement 探针不用清理：它跑完直接退出，批量落盘的定时器还没到，会话留在内存里没落过盘（实测 `~/.dsh/sessions/` 无新增）。
 
 ## 换机器要改一行
 

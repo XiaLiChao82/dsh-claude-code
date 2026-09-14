@@ -159,17 +159,70 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 
 ## 工具活动显示
 
-配置项 `toolActivityDisplay` 支持三种模式：
+配置项 `toolActivityDisplay` 支持五种模式：
 
-| 模式 | 行为 | 界面补丁 |
-| --- | --- | --- |
-| `native` | 按 SDK 消息顺序输出专用 `tool-activity` 内容块；默认值 | 需要 |
-| `fold` | 将已完成的工具活动输出为可折叠的 reasoning 内容块 | 不需要 |
-| `card` | 输出标准 DSH `tool-call` 回显卡片；卡片在外层 LLM 流结束后统一执行和显示 | 不需要 |
+| 模式 | 行为 | 实时 | 文字与卡片穿插 | 文字逐字流 | 界面补丁 | 持久化白名单 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `interleave` | 每次内层工具调用切一个 DSH **step**，卡片与文字各占独立助手消息 | 是 | **是** | 是 | 不需要 | 不需要 |
+| `live` | 直接向当前会话日志追加标准 `tool/call` + `tool/result` 事件，由原版 UI 渲染为原生工具卡片 | 是 | 否（文字集中在所有卡片之后） | 是 | 不需要 | 不需要 |
+| `native` | 按 SDK 消息顺序输出专用 `tool-activity` 内容块；默认值 | 是 | 是 | 是 | 需要 | 需要 |
+| `fold` | 将已完成的工具活动输出为可折叠的 reasoning 内容块 | 是 | 是 | 是 | 不需要 | 不需要 |
+| `card` | 输出标准 DSH `tool-call` 回显卡片；卡片在外层 LLM 流结束后统一执行和显示 | 否 | 否（卡片全部批在流末） | 是 | 不需要 | 不需要 |
+
+### `interleave` 模式（v36）
+
+唯一同时做到「顺序正确 + 内容完整 + 原生卡片 + 无需补丁」的模式，代价是每张卡片多一个 DSH step。
+
+原理是**把一次内层运行切成多个 step**，而不是试图在一条流里提前画卡片（后者做不到，见下方 `card` 的说明）。适配器在吐出一个 echo `tool-call` 之后立即结束本段流，于是：
+
+1. loop 执行这个 echo（`executeToolCalls`）→ 画出原生卡片；
+2. echo **不**调用 `concludeTurn()`，loop 因而欠一次后续请求 → 打开新的 step；
+3. 适配器从**挂起的生成器**里接着吐下一段，不重跑 Claude Code。
+
+关键点：
+
+- **每个 step 有自己的助手消息**，所以谁也盖不住谁。这正是 v34 栽的地方——它在**同一个 step** 里伪造多条助手消息，被客户端当成同一条反复改写，只剩最后一条。
+- **`concludeTurn()` 是开关。** `card` 模式的 echo 仍然调用它（那里 echo 是本轮最后一件事，多一次请求纯属浪费）；`interleave` 不调用，换来的后续请求正是它要的。见 DSH `loop.spec.ts` 的 `a tool can conclude the turn despite owing a follow-up request`。
+- **挂起期间持有真实子进程。** `interleaveState` 存着半消费的生成器和它背后的 Claude Code query。四条路径都会释放它：最后一段流干、来了非续传请求、abort、以及看门狗超时（120 秒，防止 loop 不再要求下一段却没通知适配器）。
+- **续传识别看最后一条消息**：只有「整条消息就是一个 echo 结果」才算续传（`isEchoContinuation`）。真实用户消息、steering、普通工具结果都不算，因此挂起的运行不可能劫持新输入。
+- **名字冲突时不切段。** echo 名被真实工具占用时该次运行降级为 fold，而 fold 不可执行——在那里切段会留下一个没有工具可执行的 step，导致回合提前结束。
+
+离线自检：`node probes/interleave-check.mjs`（33 项）断言分段边界、`SEGMENT_BREAK` 不外泄、挂起生成器精确续传、文字落在正确的段、末段报告耗尽以便释放资源、fold 降级不切段、`segmented:false` 与 v16 `card` 逐字节一致，以及续传识别的六种情形。其中 `THINK → TOOL → THINK → TOOL ordering, one step each` 一项直接锁定顺序契约。
+
+### `live` 模式（v33 卡片；v34 的穿插已于 v35 撤销）
+
+`live` 不走内容块投影，而是把内层 Claude Code 每次跑完的工具，按官方 agent loop 的写法直接追加进**当前父会话**的日志：一条 `tool/call`（无 `surfaceOp`）加一条 `tool/result`（`surfaceOp: 'append'`，`sourceEventSeqs` 指回 call 的 seq）。这两种都是 DSH 的标准事件，因此在**原版 dsh 上即可获得实时、顺序正确、外观原生的工具卡片**，既不需要界面补丁，也不会引入污染持久化的自定义内容块。
+
+三条设计约束：
+
+- **不写 assistant 侧的 `tool-call` 块。** 往流里吐 `tool-call` 会让 agent loop 真的去执行它（`agent.ts` 的 `executeToolCalls`），等于退回 `card` 模式的批量路径。客户端渲染卡片只看 `tool/call` / `tool/result` 这一对事件，assistant 块本就被排除在渲染之外，因此少写这一半反而更正确。
+- **`tool/result` 是 surface 事件，会进入模型历史。** 这些结果携带 `cc-live-` 前缀的 callId，`collectEchoCallIds` 据此把它们从回喂给 Claude Code 的消息里整体过滤掉——工具是 Claude 自己跑的，不能再把无主的结果塞回去。
+- **`turn` / `step` 从日志里反查（`findOpenStep`）。** 会话不变量拒绝落在已关闭 step 之外的事件，而 `GenerateOptions` 只带 `sessionId`，拿不到当前位置。取不到活会话（或会话已结束）时，`live` 自动降级为 `fold` 并告警一次。
+
+#### 为什么 `live` 的文字集中在卡片之后（v34 的失败与 v35 的撤销）
+
+v33 把卡片写进了日志，却把文字留在流里，而 agent loop 会把**一整轮**的输出在流结束时收成**一条** `assistant/message`。客户端按事件 seq 排节点，于是所有卡片必然整体落在这条消息的一侧——卡片扎一堆、文字扎一堆，排不成「文字、卡片、文字、卡片」。
+
+这在流那一侧无解：`StreamChunk` 联合类型里只有 `block-start` / `*-delta` / `block-end` / `usage` / `finish`，**没有消息分界**，适配器无法让 loop 中途落一条消息。
+
+v34 曾试图绕开：把文字**扣住不发给流**，在每张卡片之前，把攒下的这一段作为独立的 `assistant/message` 追加进日志。会话不变量确实放行（只检查 `requireOpenStep`），但**客户端不放行**——它按 `turn:step` 给助手节点做键，同一个 step 的每次追加都**整体替换**已有的块。于是同一轮里追加的 15 条消息被当成「同一条消息刷新了 15 次」，只画最后一条：所有中间的思维链和正文在界面上全部消失（日志里仍然完整）。
+
+**v35 因此关掉了 withhold**（`withholdProse` 恒为 `false`），`live` 回到 v33 的行为：内容一个字都不丢，代价是文字集中在所有卡片之后，且恢复逐字流式输出。
+
+想要真正的穿插，用 `interleave`——它靠**多开 step**（每个 step 有自己的助手消息）绕过这条限制，而不是在一个 step 里挤多条消息。
+
+离线自检：`node probes/live-sink-check.mjs`（31 项）用假 SDK 流和假 Session 驱动一遍，断言事件类型、surface 元数据、三处 callId 一致、turn/step 钉在开放 step 上、选中的卡片类型、live 模式下**不向流里发出工具块**，以及 v35 的契约——**全部**文字与思维链留在流里、流里的块下标不留空洞。`prose` 入口仍为子会话镜像保留并单独做形状断言。
 
 `native` 模式依赖 `dsh-patches/tool-activity/` 中的 DSH Web 补丁，使 Chat 与 Trajectory 客户端能够识别并渲染 `tool-activity` 内容块，同时使中断处理保留已完成的活动块。`fold` 使用现有 reasoning 渲染路径；`card` 使用标准 `tool-call` 回显路径。
 
-当前源码中的补丁探测和自动降级逻辑仍以 `card` 为检测条件，与实际内容块路径不一致。因此部署时不能依赖自动降级来判断 `native` 模式是否可用，应通过 `verify.mjs` 或 `checkup.mjs` 显式验证补丁状态。
+**dsh ≥0.1.5-rc.1 的持久化限制（v32）**：新版 dsh 在读取存储会话时执行严格的内容块白名单校验（v2→v3 迁移，只认 `text/reasoning/image/file/tool-call/tool-result`），`tool-activity` 不在其中——包含它的会话冷读直接失败（"cannot safely transform unclassified message content kind"）。写入路径不校验，所以落盘时毫无征兆。因此插件对 `native` 做双探测自动降级：界面补丁在位 **且** 持久化白名单收录 `tool-activity` 才启用，任一缺失即回退 `fold` 并告警一次。在未打补丁的原版 dsh ≥0.1.5 上，`native` 恒降级为 `fold`；`card` 与 `fold` 不受影响（`card` 旧版的降级逻辑是残留物，已移除）。
+
+已被 `native` 模式污染的历史会话日志，用一次性脚本修复（`tool-activity` 块原地改写为 fold 等价的 reasoning 块，原文件保留为 `*.tool-activity.bak`）：
+
+```bash
+node dsh-patches/tool-activity/repair-sessions.mjs --dry-run   # 预览
+node dsh-patches/tool-activity/repair-sessions.mjs             # 执行修复
+```
 
 `showToolActivity: false` 可完全关闭工具活动投影。`toolResultDisplayChars` 控制单次工具结果在界面中的最大展示字符数。
 
@@ -231,7 +284,7 @@ Claude Code 升级后若怀疑镜像失效，先跑 `node checkup.mjs --live`。
 | `showThinking` | `true` | 请求并显示摘要化推理内容 |
 | `persistSession` | `false` | SDK 会话持久化配置；`nativeResume` 开启时会被强制为 `true` |
 | `showToolActivity` | `true` | 是否显示 Claude Code 工具活动 |
-| `toolActivityDisplay` | `native` | 工具活动展示模式：`native`、`fold` 或 `card` |
+| `toolActivityDisplay` | `native` | 工具活动展示模式：`interleave`、`live`、`native`、`fold` 或 `card` |
 | `permissionMode` | `bypassPermissions` | Claude Agent SDK 权限模式 |
 | `askUserQuestion` | `true` | 是否将 `AskUserQuestion` 接入 DSH 提问界面 |
 | `imageMaxPixels` | `4194304` | 单张图片最大像素数 |
@@ -333,7 +386,7 @@ git apply -R compat/dsh-0.1.1-rc.2.patch
 
 ## Web 补丁
 
-使用默认 `toolActivityDisplay: native` 时需要应用补丁：
+使用默认 `toolActivityDisplay: native` 时需要应用补丁（注意：dsh ≥0.1.5-rc.1 上还需持久化白名单收录 `tool-activity`，否则 `native` 仍会自动降级为 `fold`）：
 
 ```bash
 node dsh-patches/tool-activity/apply.mjs
@@ -357,6 +410,8 @@ node checkup.mjs --live
 | `verify-compact.mjs` | 在模拟 Cordis/DSH 环境中执行综合离线回归，验证命令分发、权限映射、工具桥接、消息结构和子代理镜像；当前为 261 项 |
 | `checkup.mjs` | 读取当前 DSH 安装目录，检查服务名、方法签名、语义假设、补丁状态和安装状态 |
 | `checkup.mjs --live` | 在静态检查之外启动真实 Claude Code 会话，验证 SDK 输出格式及原生工具行为 |
+| `probes/live-sink-check.mjs` | `live` 模式的离线断言：事件形状、callId 一致、turn/step 归属，以及 v35 的「全部文字留在流里」契约；当前为 31 项 |
+| `probes/interleave-check.mjs` | `interleave` 模式的离线断言：分段边界、挂起生成器续传、顺序契约、fold 降级不切段、续传识别；当前为 33 项 |
 | `probes/`（两阶段，见 [probes/README.md](probes/README.md)） | 用生产驱动写出真实子会话再由全新进程冷读，验证镜像事件形状能过还原校验 |
 
 升级 DSH、Claude Code 或 Claude Agent SDK 后，至少运行前两项。模拟测试无法发现 DSH 内部服务改名等兼容性变化，因此不能替代 `checkup.mjs`；`checkup.mjs` 也不检查会话事件形状能否被还原校验接受，那一层只有 `probes/` 覆盖。
@@ -378,7 +433,7 @@ node checkup.mjs --root /path/to/dsh/node_modules/@deepseek-ai
 | `checkup.mjs` | 面向真实 DSH 安装的兼容性检查 |
 | `verify-compact.mjs` | 面向模拟环境的逻辑与回归测试 |
 | `e2e-*.mjs` | 针对工具桥接、权限切换和别名行为的专项测试 |
-| `dsh-patches/tool-activity/` | `native` 显示模式所需的 DSH Web 补丁及验证脚本 |
+| `dsh-patches/tool-activity/` | `native` 显示模式所需的 DSH Web 补丁、验证脚本，及历史会话修复脚本 `repair-sessions.mjs` |
 | `compat/dsh-0.1.1-rc.2.patch` | DSH `0.1.1-rc.2` 兼容补丁 |
 | `INSTALL.md` | 历史实现记录、实验依据和详细排障信息 |
 | `main-versions-v10-v28.tar.gz` | 早期开发入口归档 |
@@ -394,8 +449,7 @@ node checkup.mjs --root /path/to/dsh/node_modules/@deepseek-ai
 - DSH 自动上下文压缩仍由 DSH 自身处理；它与手动内层 `/compact` 作用于不同历史层。
 - DSH 每轮开始时会清空任务列表投影，因此 `todo_write` 在 DSH 面板中的生命周期与 Claude Code 原生 TodoWrite 不同。
 - DSH `read` / `read_image` 不覆盖 Claude Code 原生 Read 对 PDF 和 Jupyter Notebook 的处理能力。
-- `native` 模式的 Web 补丁不属于 npm 包可持久维护的文件，DSH 升级后需要重新应用。
-- 当前补丁探测逻辑与实际需要补丁的显示模式不一致；这是已记录的实现问题，部署检查应以补丁验证脚本和 `checkup.mjs` 为准。
+- `native` 模式的 Web 补丁不属于 npm 包可持久维护的文件，DSH 升级后需要重新应用；且 dsh ≥0.1.5-rc.1 的持久化白名单不收 `tool-activity`，原版安装上 `native` 会自动降级为 `fold`（见上文）。
 - `checkup.mjs` 的默认 DSH 包路径与当前开发环境相关；其他环境应使用 `--root`。
 - 镜像子会话不显示实时运行状态，且不随父会话的历史编辑或分支切换回滚。
 - `turn/end` 的 `reason` 只有 `completed`、`blocked`、`max-tokens`、`interrupted` 四个单键取值能通过 DSH 的还原校验；`error` 与 `aborted` 需要额外字段，写错只在冷读时暴露。
