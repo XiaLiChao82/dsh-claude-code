@@ -7,6 +7,22 @@
 // acknowledged with an explicit bridge note (see buildSystemAppend) instead of
 // being silently dropped on the floor.
 //
+// v43 deletes the `native` display mode and everything that existed only to
+// serve it: the two DSH-source probes, degradeToolActivityDisplay, the
+// tool-activity block builder/emitter, and the `<tool-activity>` replay branch.
+// The mode shipped a `tool-activity` content kind DSH does not know, so it
+// needed a patch inside the DSH install to render and a persistence allowlist
+// entry to survive a reload — both of which an upgrade silently reverts. That
+// patch no longer applies at all (its target function `toolActivitySummary` is
+// gone from DSH 0.1.5-rc.1), so the double probe had been resolving `native`
+// down to `fold` for some time: the mode was already dead, just not buried.
+// v41's client plugin reaches the same goal through official extension points
+// only — `session.append` for the card, a keyed `tool.call.toolview` to hide
+// the driver — so nothing here touches DSH source any more. Verified before
+// deleting: 232 session logs, zero containing a `tool-activity` block, i.e.
+// the repair script had nothing left to repair. DEFAULTS now say `interleave`;
+// anyone who never set the key was silently getting `fold`.
+//
 // v42 strips the ECHO_DRIVER block down to what a step cut actually needs.
 // v41 split card-drawing from step-driving but only moved the DRAWING; the
 // driver's payload stayed v16-shaped, so every hidden block still shipped a
@@ -261,6 +277,10 @@
 //   - Historical logs are repaired in place by dsh-patches/tool-activity/
 //     repair-sessions.mjs (tool-activity blocks → fold-equivalent reasoning
 //     blocks, original kept as *.tool-activity.bak).
+//     [v43: that script is gone — a sweep of 232 local session logs found zero
+//     tool-activity blocks, because the double probe had been degrading native
+//     to fold all along. Recoverable from git history at 0.33.0 if some other
+//     machine turns out to hold a contaminated log.]
 //
 // v21 adds a display-only `tool-activity` content block:
 //   - Same real-time ordering as v20 fold (emitted when each inner tool_result
@@ -478,7 +498,7 @@ export const DEFAULTS = {
   showThinking: true,
   persistSession: false,
   showToolActivity: true,
-  toolActivityDisplay: 'native',
+  toolActivityDisplay: 'interleave',
   permissionMode: 'bypassPermissions',
   imageMaxPixels: 2048 * 2048,
   imageMaxBytes: 1024 * 1024,
@@ -509,10 +529,11 @@ const Config = z.object({
   showThinking: z.boolean(),
   persistSession: z.boolean(),
   showToolActivity: z.boolean(),
-  // 'native' (ordered display-only tool-activity cards, default), 'fold'
+  // 'interleave' (a DSH step per card, rich cards, default), 'live' (rich
+  // cards appended to the session log; all prose lands after them), 'fold'
   // (ordered Think rows), or 'card' (tool-call echo cards after the stream).
   // A plain string keeps the settings schema simple; config() clamps unknown
-  // values to 'native'.
+  // values to the default.
   toolActivityDisplay: z.string(),
   // Inner-session permission mode passed to the Claude Agent SDK. Clamped to
   // PERMISSION_MODES; 'bypassPermissions' additionally sends
@@ -560,7 +581,7 @@ export function resolvePermissionMode(value) {
   return PERMISSION_MODES.includes(value) ? value : DEFAULTS.permissionMode
 }
 
-export const TOOL_ACTIVITY_DISPLAYS = ['native', 'fold', 'card', 'live', 'interleave']
+export const TOOL_ACTIVITY_DISPLAYS = ['fold', 'card', 'live', 'interleave']
 
 /**
  * Modes whose visible card is appended by the live sink rather than yielded
@@ -589,151 +610,27 @@ export const SINK_MODES = new Set(['live', 'interleave'])
 export const SEGMENT_BREAK = '__cc-segment-break'
 
 /**
- * Whether the tool-activity UI patch is present in the DSH install.
- *
- * `native` mode emits a custom content block that only a PATCHED DSH renders;
- * against an unpatched install the trajectory panel throws a TypeError. The
- * patch lives inside DSH's own bundle files, so a published package cannot
- * carry it and every DSH upgrade wipes it — see dsh-patches/tool-activity/.
- *
- * Three-valued on purpose. `'unknown'` (module not resolvable, exports map
- * hides package.json, file unreadable) must NOT degrade anything: a wrong
- * guess would silently take `card` away from a correctly patched install.
- * Only a confident `false` degrades.
- *
- * Cached: `config()` re-runs on every read, and this touches the filesystem.
+ * Modes this plugin used to accept, mapped to nothing — kept ONLY so an
+ * upgrader who still has the old value in settings.yaml gets told once why
+ * their configured mode is not the one running. Silent clamping is fine for a
+ * typo; it is not fine for a value that was this plugin's own default for
+ * twenty versions.
  */
-let toolActivityPatchState
+const RETIRED_TOOL_ACTIVITY_DISPLAYS = new Set(['native'])
+const warnedRetiredDisplays = new Set()
 
-export function toolActivityPatchPresent() {
-  if (toolActivityPatchState !== undefined) return toolActivityPatchState
-  try {
-    const require = createRequire(import.meta.url)
-    // The UI packages are INTERNAL to the DSH install: they sit in dsh's own
-    // node_modules, not in the profile-level `@deepseek-ai` directory a plugin
-    // resolves through, so requesting one by name always fails. Anchor on a
-    // package this plugin already imports at the top of the file, then walk up
-    // to the shared `@deepseek-ai` root (the same ROOT checkup.mjs scans).
-    const anchor = require.resolve('@deepseek-ai/dsh-llm/package.json')
-    const root = join(anchor, '..', '..')
-    const source = readFileSync(join(root, 'dsh-client-ui-trajectory/lib/client.js'), 'utf8')
-    toolActivityPatchState = source.includes('tool-activity')
-  } catch {
-    toolActivityPatchState = 'unknown'
-  }
-  return toolActivityPatchState
-}
-
-/** Reset the cached probe. Tests only. */
-export function resetToolActivityPatchProbe() {
-  toolActivityPatchState = undefined
-}
-
-/**
- * Whether the installed dsh PERSISTENCE layer admits `tool-activity` content
- * blocks (v32).
- *
- * The UI probe above governs rendering; this one governs whether the block
- * can reach disk without bricking the session. dsh 0.1.5-rc.1 enforces a
- * strict content-kind allowlist both in the v2→v3 format migration
- * (dsh-session-format-v2-to-v3) and the JSONL persistence worker when a
- * stored artifact is observed — an unknown kind makes the whole session fail
- * to load, while the append path stays permissive, so nothing looks wrong
- * until a cold read. Both bundles build CONTENT_KINDS from a literal; stock
- * dsh names only text/reasoning/image/file/tool-call/tool-result.
- *
- * Three-valued like the UI probe: `'unknown'` must not degrade anything.
- * Cached for the same reason.
- */
-let toolActivityPersistenceState
-
-export function toolActivityPersistencePresent() {
-  if (toolActivityPersistenceState !== undefined) return toolActivityPersistenceState
-  try {
-    const require = createRequire(import.meta.url)
-    // Same internal-root walk-up as the UI probe above: the session-format
-    // packages sit beside dsh-llm under dsh's own @deepseek-ai directory.
-    const anchor = require.resolve('@deepseek-ai/dsh-llm/package.json')
-    const root = join(anchor, '..', '..')
-    const sources = [
-      join(root, 'dsh-session-format-v2-to-v3/lib/index.js'),
-      join(root, 'dsh-session-persistence-jsonl/lib/worker.cjs'),
-    ].map((path) => readFileSync(path, 'utf8'))
-    // Admission means the allowlist literal itself names the kind.
-    toolActivityPersistenceState = sources.every((source) => /CONTENT_KINDS[^)]*"tool-activity"/.test(source))
-  } catch {
-    toolActivityPersistenceState = 'unknown'
-  }
-  return toolActivityPersistenceState
-}
-
-/** Reset the cached probe. Tests only. */
-export function resetToolActivityPersistenceProbe() {
-  toolActivityPersistenceState = undefined
-}
-
-/**
- * Degrade `native` to `fold` when the install cannot safely carry its blocks.
- *
- * v32: `native` is the only mode that persists a custom `tool-activity`
- * content block. It needs BOTH the UI patch (or the trajectory panel throws
- * on the unknown block) AND persistence admission (or dsh ≥0.1.5-rc.1 refuses
- * to load the session afterwards — see repair-sessions.mjs). `fold` is the
- * closest survivor: the other real-time projection, plain `reasoning` blocks
- * that every layer accepts. `card` needs no conditions: its echo blocks are
- * standard `tool-call`s (the pre-v32 card degrade was vestigial). `live` needs
- * none either, and for a stronger reason: it emits no custom block at all,
- * only the two standard session events the loop itself writes (v33).
- *
- * Warns once — this is a deployment fact, not a per-turn one.
- * @param display - already normalised display mode.
- * @param logger - optional ctx.logger.
- * @param present - UI probe result; injectable so the degrade branch is
- *   testable on a machine where the patch IS applied.
- * @param persist - persistence probe result; injectable likewise.
- * @returns the display mode to actually use.
- */
-let toolActivityDegradeWarned = false
-
-export function degradeToolActivityDisplay(
-  display,
-  logger,
-  present = toolActivityPatchPresent(),
-  persist = toolActivityPersistencePresent(),
-) {
-  if (display !== 'native') return display
-  if (present !== false && persist !== false) return display
-  if (!toolActivityDegradeWarned) {
-    toolActivityDegradeWarned = true
-    const reasons = [
-      present === false ? '界面补丁未打（轨迹面板不认识该块）' : null,
-      persist === false ? '持久化层白名单不收 tool-activity（会话冷读会失败，dsh ≥0.1.5-rc.1）' : null,
-    ].filter(Boolean).join('；')
+/** Clamp a configured activity display; unknown → the default (`interleave`). */
+export function resolveToolActivityDisplay(value, logger) {
+  if (TOOL_ACTIVITY_DISPLAYS.includes(value)) return value
+  if (RETIRED_TOOL_ACTIVITY_DISPLAYS.has(value) && !warnedRetiredDisplays.has(value)) {
+    warnedRetiredDisplays.add(value)
     logger?.warn?.(
-      `toolActivityDisplay=native 在当前 DSH 安装上不可用（${reasons}），已自动回退到 fold。`
-        + '历史受污染会话可用 dsh-patches/tool-activity/repair-sessions.mjs 修复。',
+      `toolActivityDisplay "${value}" was removed in v43 (it required a patch inside the DSH ` +
+      `install that no longer applies); falling back to "${DEFAULTS.toolActivityDisplay}". ` +
+      `Update settings.yaml to silence this.`,
     )
   }
-  return 'fold'
-}
-
-/** Clamp a configured activity display; unknown → native (ordered, not executed). */
-export function resolveToolActivityDisplay(value) {
-  return TOOL_ACTIVITY_DISPLAYS.includes(value) ? value : DEFAULTS.toolActivityDisplay
-}
-
-/** One display-only activity block. Never a DSH execution request. */
-export function buildToolActivityBlock(use, output, isError) {
-  return {
-    type: 'tool-activity',
-    // Bridged DSH tools show under the native name they replaced, so swapping
-    // an implementation stays invisible in the transcript — see
-    // bridgeDisplayName.
-    name: bridgeDisplayName(use?.name) ?? 'tool',
-    input: use?.input && typeof use.input === 'object' ? use.input : {},
-    output: typeof output === 'string' && output.length > 0 ? output : '(no output)',
-    isError: isError === true,
-  }
+  return DEFAULTS.toolActivityDisplay
 }
 
 // ─── Subagent mirroring: DSH session-event builders ─────────────────────
@@ -1380,8 +1277,8 @@ const REPLAY_STATUS_MAX_CHARS = 800
 // The `▸ ` sentinel stays INSIDE the tag: replayText below identifies
 // activity blocks by that prefix, and the tag already supplies the isolation.
 //
-// Scope: prompt text only. The DSH transcript renders from
-// buildToolActivityBlock's structured data, so display is untouched.
+// Scope: prompt text only. The DSH transcript renders from its own blocks and
+// session events, so display is untouched.
 const ACTIVITY_REPLAY_OPEN = '<tool-activity>'
 const ACTIVITY_REPLAY_CLOSE = '</tool-activity>'
 
@@ -1406,19 +1303,9 @@ function replayText(block) {
   return text
 }
 
-function activityReplayLine(block) {
-  const mark = block?.isError ? '✗' : '✓'
-  const input = block?.input && typeof block.input === 'object' ? block.input : {}
-  const summary = [input.description, input.command, input.file_path, input.path, input.pattern, input.query, input.url]
-    .find((value) => typeof value === 'string' && value.length > 0) || ''
-  const output = typeof block?.output === 'string' ? block.output : ''
-  return wrapActivityReplay(`▸ ${block?.name ?? 'tool'} ${mark} · ${summary}\n$ ${summary}\n\n${output}`)
-}
-
 function blockText(block, images) {
   if (block?.type === 'text') return replayText(block)
   if (block?.type === 'reasoning') return replayText(block)
-  if (block?.type === 'tool-activity') return activityReplayLine(block)
   if (block?.type === 'tool-call') return `[DSH tool request ${block.name}: ${block.arguments ?? ''}]`
   if (block?.type === 'tool-result') {
     const text = (block.content ?? []).filter((item) => item?.type === 'text').map((item) => item.text).join('')
@@ -2132,17 +2019,6 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
     ]
   }
 
-  // Display-only activity: same start/end chunk pair as other blocks so the
-  // stream invariant stays happy, but the type is never tool-call.
-  const emitNativeActivityBlock = (use, output, isError) => {
-    const index = nextIndex++
-    const block = buildToolActivityBlock(use, output, isError)
-    return [
-      { type: 'block-start', index, blockType: 'tool-activity' },
-      { type: 'block-end', index, block },
-    ]
-  }
-
   // One complete tool-call block for an ECHO tool: the agent loop dispatches
   // it after the stream settles, the echo concludes the turn with no follow-up
   // request, and the transcript gains a native collapsible tool card with the
@@ -2270,12 +2146,6 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
         } else if (activityDisplay === 'fold') {
           for (const fold of describeToolActivityFolds(results, useOf, toolResultDisplayChars)) {
             yield* emitFoldBlock(fold)
-          }
-        } else if (activityDisplay === 'native') {
-          for (const block of results) {
-            const use = useOf(block?.tool_use_id)
-            if (use === undefined) continue
-            yield* emitNativeActivityBlock(use, resultText(block?.content, toolResultDisplayChars) || '(no output)', block?.is_error === true)
           }
         } else {
           for (const block of results) {
@@ -2931,13 +2801,10 @@ export function apply(ctx, rawConfig = {}) {
     return {
       ...merged,
       permissionMode: resolvePermissionMode(merged.permissionMode),
-      // Degrade AFTER normalising: `native` is the default, and it is the one
-      // mode whose blocks need a patched UI AND an admitting persistence
-      // layer — see degradeToolActivityDisplay (v32).
-      toolActivityDisplay: degradeToolActivityDisplay(
-        resolveToolActivityDisplay(merged.toolActivityDisplay),
-        ctx.logger,
-      ),
+      // v43: no mode needs a patched install any more, so there is nothing to
+      // degrade. Every surviving mode emits only standard content blocks or
+      // standard session events.
+      toolActivityDisplay: resolveToolActivityDisplay(merged.toolActivityDisplay),
     }
   }
   const logger = ctx.logger
@@ -3080,8 +2947,9 @@ export function apply(ctx, rawConfig = {}) {
   //
   //   1. It cannot read the mode here. `config()` is `{...DEFAULTS, ...current()}`
   //      and the settings document has not loaded at apply time, so the gate saw
-  //      DEFAULTS.toolActivityDisplay ('native'), watched degradeToolActivityDisplay
-  //      knock it down to a fold for want of the UI patch, and skipped
+  //      DEFAULTS.toolActivityDisplay — then 'native' — watched the (now
+  //      deleted, v43) degrade helper knock it down to a fold for want of the
+  //      UI patch, and skipped
   //      registration — leaving `interleave` with no echoes to emit. Observed
   //      2026-09-15 via probes/e2e-scope.patch.yml: settings said `interleave`,
   //      the agent scope showed `echo tools registered: (none)`.
@@ -3430,7 +3298,10 @@ export function apply(ctx, rawConfig = {}) {
         // collision-free and renders as nothing (src/client/index.js).
         // No sink (no live session) degrades interleave to its v40 shape:
         // the echo block is the card again, generic row and all.
-        const activitySink = SINK_MODES.has(resolveToolActivityDisplay(resolved.toolActivityDisplay))
+        // `logger` here is also what surfaces the one-shot retired-mode warning
+        // (v43): this runs per request, i.e. after settings have loaded, unlike
+        // apply() — see the v39 note about reading live config too early.
+        const activitySink = SINK_MODES.has(resolveToolActivityDisplay(resolved.toolActivityDisplay, logger))
           && typeof options.sessionId === 'string' && options.sessionId.length > 0
           ? createLiveActivitySink({ session: sessions.get(options.sessionId), logger, model: options.model })
           : undefined

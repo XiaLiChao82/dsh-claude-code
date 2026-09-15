@@ -13,7 +13,10 @@
  *
  * Run: node probes/client-driver-check.mjs
  */
-import { ECHO_DRIVER, ECHO_FALLBACK, ECHO_VARIANTS, SINK_MODES, TOOL_ACTIVITY_DISPLAYS } from '../main.v20.mjs'
+import {
+  ECHO_DRIVER, ECHO_FALLBACK, ECHO_VARIANTS, SINK_MODES,
+  TOOL_ACTIVITY_DISPLAYS, resolveToolActivityDisplay,
+} from '../main.v20.mjs'
 import { DRIVER_KEYS, MARKER, STYLE } from '../src/client/driver-names.js'
 
 let failures = 0
@@ -64,10 +67,30 @@ check('live appends its card', SINK_MODES.has('live'))
 check('interleave appends its card (v41)', SINK_MODES.has('interleave'))
 check('card still batches at end of stream', !SINK_MODES.has('card'))
 check('fold never touches the session', !SINK_MODES.has('fold'))
-check('native never touches the session', !SINK_MODES.has('native'))
 for (const mode of SINK_MODES) {
   check(`${mode} is a real display mode`, TOOL_ACTIVITY_DISPLAYS.includes(mode))
 }
+
+// v43 removed `native`. It required a patch inside the DSH install, and that
+// patch stopped applying at DSH 0.1.5-rc.1 — so the mode had been silently
+// degrading for a while. What must hold now: it is gone, a leftover config
+// value still resolves to something usable, and the swap is not silent.
+console.log('retired native mode (v43)')
+check('native is not a selectable mode', !TOOL_ACTIVITY_DISPLAYS.includes('native'))
+check('default is a real mode', TOOL_ACTIVITY_DISPLAYS.includes(resolveToolActivityDisplay(undefined)))
+check('leftover native config resolves to the default',
+  resolveToolActivityDisplay('native') === resolveToolActivityDisplay(undefined))
+
+const warnings = []
+const spy = { warn: (m) => warnings.push(m) }
+// Fresh value each run would be ideal, but the warn-once set is module-level;
+// assert on behaviour that holds regardless of who called first.
+resolveToolActivityDisplay('native', spy)
+resolveToolActivityDisplay('native', spy)
+check('retired mode warns at most once', warnings.length <= 1)
+check('a plain typo never warns',
+  (() => { const t = []; resolveToolActivityDisplay('nonsense', { warn: (m) => t.push(m) }); return t.length === 0 })())
+check('no logger is not a crash', resolveToolActivityDisplay('native') === resolveToolActivityDisplay(undefined))
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) FAILED.`)
 process.exit(failures === 0 ? 0 : 1)

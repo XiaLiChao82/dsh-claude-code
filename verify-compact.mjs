@@ -1,5 +1,5 @@
 // 验证 v23 的 /compact 分流：不需要真的起 dsh，用假 ctx 跑一遍 apply。
-import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, buildToolActivityBlock, describeToolActivityFolds, serializeConversation, appendMirrorEvent, buildMirrorChildMeta, buildMirrorDescriptor, buildMirrorToolCallBlock, buildMirrorToolResultBlock, buildMirrorUserEvent, buildMirrorAssistantEvent, buildMirrorToolResultEvent, createMirrorCollector, createMirrorDriver, translateSdkMessages, MIRROR_DESCRIPTOR_VERSION, DEFAULTS } from './main.v20.mjs'
+import { apply, planReplay, usageOf, resolveEffectivePermissionMode, stripAbsentToolGuidance, buildSystemAppend, jsonSchemaToZodShape, toMcpResult, buildDshToolBridge, buildNativeToolOverride, bridgeDisplayName, describeToolActivityFolds, serializeConversation, appendMirrorEvent, buildMirrorChildMeta, buildMirrorDescriptor, buildMirrorToolCallBlock, buildMirrorToolResultBlock, buildMirrorUserEvent, buildMirrorAssistantEvent, buildMirrorToolResultEvent, createMirrorCollector, createMirrorDriver, translateSdkMessages, MIRROR_DESCRIPTOR_VERSION, DEFAULTS } from './main.v20.mjs'
 import { readFileSync } from 'node:fs'
 
 let pass = 0, fail = 0
@@ -512,14 +512,7 @@ console.log('\nv28: 文件工具换成 DSH 的（写入进沙箱），显示名�
   check('非字符串不炸', bridgeDisplayName(undefined) === undefined)
   check('前缀相似但不相等的名字不动', bridgeDisplayName('mcp__dshx__bash') === 'mcp__dshx__bash')
 
-  // —— 三条显示路径都用映射名 ——
-  const block = buildToolActivityBlock({ name: 'mcp__dsh__edit', input: { file_path: '/a' } }, 'ok', false)
-  check('活动块用映射后的名字', block.name === 'Edit', String(block.name))
-  const blockMcp = buildToolActivityBlock({ name: 'mcp__filesystem__read_file', input: {} }, 'ok', false)
-  check('活动块不动真外挂 MCP 的名字', blockMcp.name === 'mcp__filesystem__read_file')
-  const blockNone = buildToolActivityBlock(undefined, '', false)
-  check('活动块缺 use 时兜底', blockNone.name === 'tool')
-
+  // —— 显示路径都用映射名（v43 起 native 那条已删，fold/card 仍在）——
   const folds = describeToolActivityFolds(
     [{ tool_use_id: 't1', content: [{ type: 'text', text: 'out' }] }],
     () => ({ name: 'mcp__dsh__bash', inputLine: 'ls' }),
@@ -601,14 +594,9 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
 // 末尾伪造出下一次调用的卡片头（实测：resume 的 6 轮 0 处，重启后全量
 // replay 那一轮 11 处）。标签把它们标成结构化记录而不是待模仿的样式。
 {
-  const activity = (name, summary, output = 'ok') => buildToolActivityBlock(
-    { name, input: { description: summary } }, output, false,
-  )
-  const one = serializeConversation([{ role: 'assistant', content: [activity('Bash', 'git status')] }])
-  check('⑥ 活动块 replay 带隔离标记',
-    one.includes('<tool-activity>') && one.includes('</tool-activity>'), one.slice(0, 90))
-  check('⑥ 标记内保留 ▸ sentinel（replayText 靠它识别活动块）',
-    one.includes('<tool-activity>\n▸ Bash ✓ · git status\n$ git status'), one.slice(0, 140))
+  // v43 删掉了 native 模式，`tool-activity` 块不再产生，原先针对它的两项断言
+  // 随之移除。隔离标记本身仍然在用——fold 走 reasoning 通道、legacy 走 text
+  // 通道，两者都靠 replayText 的前缀识别，下面三项覆盖的正是这条活路径。
 
   // fold 模式的活动块走 reasoning 通道，文本自身以 ▸ 开头
   const fold = serializeConversation([
@@ -629,9 +617,10 @@ console.log('\nv29: dshTools 开关（关掉即逐字回到 v25）')
   ])
   check('⑥ 真实思考与正文不被包裹', !prose.includes('<tool-activity>'), prose)
 
-  // 裁剪仍生效；标签是固定开销，不占内容预算
+  // 裁剪仍生效；标签是固定开销，不占内容预算。v43 起用 fold 形状构造（原先
+  // 走已删的 buildToolActivityBlock），裁剪走的是同一个 wrapActivityReplay。
   const long = serializeConversation([
-    { role: 'assistant', content: [activity('Bash', 'build', 'x'.repeat(3000))] },
+    { role: 'assistant', content: [{ type: 'reasoning', text: `▸ Bash ✓ · build\n$ build\n\n${'x'.repeat(3000)}` }] },
   ])
   check('⑥ 超长活动块仍被裁剪', long.includes('… [replay truncated]'), long.slice(-60))
   const head = '<tool-activity>\n'

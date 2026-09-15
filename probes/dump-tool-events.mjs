@@ -11,8 +11,9 @@ import { spawnSync } from 'node:child_process'
 const ROOT = join(homedir(), '.dsh', 'sessions')
 
 // The log is a MULTI-FRAME zstd stream (header frame + body frames); node's
-// zstdDecompressSync stops after the first frame, so shell out to `zstd -d`
-// which concatenates every frame — see repair-sessions.mjs.
+// zstdDecompressSync stops after the FIRST frame and returns a truncated log
+// without erroring, which reads as "the session only has a few events". Shell
+// out to `zstd -dc`, which concatenates every frame.
 function readLog(file) {
   const r = spawnSync('zstd', ['-dc', file], { maxBuffer: 1 << 30 })
   if (r.status !== 0) throw new Error(`zstd failed: ${r.stderr}`)

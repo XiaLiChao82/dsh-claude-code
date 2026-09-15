@@ -27,15 +27,18 @@ patch.yml 安装后应指向 **main.v29.mjs**（实现仍在 `main.v20.mjs`，
 | 4 处界面补丁 | DSH 安装目录内 | **必被覆盖** |
 | 插件 + patch.yml | `~/.dsh/profiles/web/` | 不被覆盖 |
 
-两条命令搞定：
+一条命令搞定：
 
 ```bash
-node checkup.mjs                          # 体检：43 项，说明每项坏了影响什么
-node dsh-patches/tool-activity/apply.mjs  # 界面补丁被覆盖时重打
+node checkup.mjs   # 体检：说明每项坏了影响什么
 ```
 
-`checkup.mjs` 输出末尾会直接判断：只有界面补丁 FAIL 就重打即可；
-如果 DSH 内部结构变了，它会指名哪一处、影响哪个功能。
+`checkup.mjs` 输出末尾会直接判断：DSH 内部结构变了的话，它会指名哪一处、
+影响哪个功能。
+
+**v43 起不再有界面补丁可打。** 原先只有 `native` 显示模式需要它，该模式已
+连同 `dsh-patches/` 目录一并移除——现存四种模式都只发标准内容块或标准会话
+事件。下文 v14/v20 等章节里关于补丁的描述属于历史记录，不再是操作指引。
 
 ### 为什么需要 checkup.mjs，verify-compact.mjs 不够
 
@@ -239,6 +242,10 @@ profile 目录跑。
   `usage` 整个缺失时返回全 0，不抛异常。
 
 ## v21：实时 display-only 工具卡，保留官方 Think / Markdown
+
+> **历史记录，非操作指引。** 本节描述的 `native` 模式及其 `dsh-patches/` 补丁
+> 已于 v43 整体删除，下文的安装/自检命令指向的文件不再存在。同样的实时工具卡
+> 效果现由 `interleave`/`live` 模式经官方扩展点实现，不需要改 DSH 源码。
 
 - **协议**：每个内层 `tool_result` 立即发出 `tool-activity` 块
   （`block-start` + `block-end`）。它不是 `reasoning`，也不是 `tool-call`，

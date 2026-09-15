@@ -382,34 +382,10 @@ if (sdkSrc !== undefined) {
     '搜不到这个 code')
 }
 
-// ---------------------------------------------------------------- ui patches
-// These four live INSIDE the DSH install, so an upgrade always wipes them.
-// Only `native` needs them: `live` writes standard tool/call + tool/result
-// events that stock DSH renders, and `fold`/`card` reuse existing block paths.
-// Reporting a missing patch under those modes is a false alarm, so the section
-// is skipped entirely — a checkup that cries wolf stops being read.
-const SETTINGS = readIf(join(process.env.HOME ?? '', '.dsh/settings.yaml')) ?? ''
-const CONFIGURED_DISPLAY = (/^\s*toolActivityDisplay:\s*['"]?([a-z]+)/m.exec(SETTINGS)?.[1]) ?? 'native'
-heading('界面补丁（在 DSH 目录内，升级必被覆盖）')
-if (CONFIGURED_DISPLAY !== 'native') {
-  console.log(`  SKIP  toolActivityDisplay 配的是 \`${CONFIGURED_DISPLAY}\`，该模式不依赖界面补丁`)
-}
-const MARKER = 'tool-activity'
-// 0.1.2-rc.1 起 dsh-client-runtime 包被上游删除（be531688f3），分类器被内联进
-// 每个消费者 bundle：chat 一份、trajectory 一份，两份都得打；卡片也从
-// dsh-client-ui-conversation 搬到了 dsh-client-ui-chat。
-const UI_TARGETS = [
-  ['dsh-client-ui-chat/lib/client.js', '工具卡退回「未知内容块」/ 不渲染'],
-  ['dsh-llm/lib/index.js', '中断后已完成的工具卡丢失'],
-  ['dsh-client-ui-trajectory/lib/client.js', '轨迹面板崩溃（TypeError）'],
-]
-for (const [rel, impact] of CONFIGURED_DISPLAY === 'native' ? UI_TARGETS : []) {
-  const src = readIf(join(ROOT, rel))
-  const hits = src === undefined ? 0 : src.split(MARKER).length - 1
-  check('ui', `${basename(dirname(dirname(rel)))} 补丁在位`, hits > 0,
-    `${impact} — 跑 node dsh-patches/tool-activity/apply.mjs 重打`,
-    src === undefined ? '文件不存在' : hits === 0 ? '补丁已被升级覆盖' : undefined)
-}
+// v43: 界面补丁检查整节删除。它只服务 `native` 显示模式，而 native 本身已被
+// 移除——它要打进 DSH 安装目录的那个函数（toolActivitySummary）在 0.1.5-rc.1
+// 里已不存在，补丁不是「失效」而是根本打不上。现存四种模式全部只发标准内容块
+// 或标准会话事件，没有一种依赖对 DSH 源码的改动。
 
 // ---------------------------------------------------------------- install
 // v30 起本插件是正规组合包（见 DSH docs/user/develop/basic/publish.zh.md）：
@@ -661,8 +637,7 @@ if (failures.length === 0) {
   process.exit(0)
 }
 console.log(`${failures.length} 项未通过（${pass} 项通过）`)
-const uiOnly = failures.every((f) => f.group === 'ui')
-console.log(uiOnly
-  ? '\n只有界面补丁被覆盖 — 跑 node dsh-patches/tool-activity/apply.mjs 就能全部复原，不需要重新改插件。'
-  : '\nDSH 内部结构变了，上面列出的功能需要按新版本重新推导。把这份输出给我即可。')
+// v43 起没有「只是界面补丁被覆盖」这一类失败了：插件不再往 DSH 安装目录里
+// 打任何补丁，所以任何失败都意味着 DSH 的内部结构真的变了。
+console.log('\nDSH 内部结构变了，上面列出的功能需要按新版本重新推导。把这份输出给我即可。')
 process.exit(1)
