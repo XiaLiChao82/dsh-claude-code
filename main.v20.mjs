@@ -7,6 +7,143 @@
 // acknowledged with an explicit bridge note (see buildSystemAppend) instead of
 // being silently dropped on the floor.
 //
+// v42 strips the ECHO_DRIVER block down to what a step cut actually needs.
+// v41 split card-drawing from step-driving but only moved the DRAWING; the
+// driver's payload stayed v16-shaped, so every hidden block still shipped a
+// full copy of the native call — 1179 bytes average over one real session, 18
+// of 34 carrying a verbatim shell command. Two costs, the second the reason it
+// is worth a version: a reader of the log sees `ClaudeCodeActivity` holding a
+// bash command and reasonably asks which of the two is real; and `output` plus
+// the marker being schema-`required` made a fully-populated driver a block that
+// WOULD pass a real tool's validation, i.e. exactly the shape that let v37's
+// echoes run a second time. See buildDriverArguments for what stays and why.
+//
+// v41 gives `interleave` its rich cards back, which v40 had to spend to buy
+// correctness. The two requirements look contradictory and are not:
+//   - The visible card must carry a LOWERCASE name — that is the key DSH's
+//     `tool.call.toolview` matches on to draw BashRow / FileMutationRow /
+//     ReadFamilyRow. (Those rich rows are keyed toolviews, NOT TOOL_VARIANTS
+//     entries; TOOL_VARIANTS only picks the look of GenericToolCard, the
+//     fallback. Verified in the DOM: the rich row renders `data-sample="bash"`,
+//     which only bash-sample.tsx writes.)
+//   - The block that CUTS THE STEP must carry a name DSH does not own, or we
+//     are back in the v37→v39 swamp.
+// So they are split across two blocks. The card is appended by the live sink
+// under the lowercase name (append never reaches the executor, so the name is
+// free — this is the same reason `live` was always safe). The echo block keeps
+// a name DSH cannot collide with and renders as nothing.
+//
+// That echo is now ONE dedicated name, ECHO_DRIVER, not nine per-tool ones.
+// Nine capitalized keys would also have swallowed v40-era history, whose cards
+// ARE those capitalized echoes: a keyed hit REPLACES the generic row and
+// `ToolCallTree`'s fallback only fires when NO key matches, so registering
+// `Bash` would blank every v40 `Bash` card ever recorded. One private name
+// cannot alias anything that already exists.
+//
+// Hiding it needs a client shape (first one for this plugin — see ./client):
+// a keyed toolview on ECHO_DRIVER returning a bare marker, plus one injected
+// rule keyed off DSH's stable `data-chat-flow-kind` / marker attributes.
+// `display:none` is required, not `:empty` — the seat still contains
+// ToolCallTree's `.callRow` element, so DSH's own `.flowItem:empty` rule never
+// matches. If that rule ever stops matching, the failure is a stray 16px gap,
+// never a broken card.
+//
+// v40 renames the echoes out of DSH's namespace, which ends the whole family.
+// v37→v39 were three fixes for three faces of ONE decision: echoing under the
+// DSH tool name that draws the prettiest card. Each face got guarded, none got
+// removed —
+//   · v38 guards the agent plane (real tool shadows echo → ToolArgsError on
+//     write/edit, silent double execution on bash/read/glob/grep);
+//   · v39 guards the global plane (host-level tool-fs applies later → throws →
+//     boot dies).
+// Both guards work by DEGRADING, so on a preset deployment every card lost its
+// identity to `claude_tool` anyway. Paying that price and still carrying two
+// guards is the worst of both.
+//
+// The echo now takes the INNER tool's name instead: `Bash`, not `bash`. DSH's
+// names are lowercase and register() enforces no charset (core/tools/src/index.ts
+// reserves only RUN_CODE_NAME), so the capitalised set collides with nothing in
+// any layer. No shadowing, so v38's guard stops firing and cards keep their
+// names. No duplicate insert, so v39's crash cannot happen. `interleave` works
+// as designed, with the card titled after the tool that actually ran.
+//
+// Cost, and it is real: the client keys a card's variant off the call name with
+// an exact case-sensitive lookup (dsh-client-ui-tool tool-call-model.ts:41,87),
+// so these land on the generic `others` row rather than the terminal/read/
+// search rows. Not a regression — v38's degradation already put them on that
+// same row under the name `claude_tool`. Rich rows are a client-side job (the
+// keyed `tool.call.toolview` slot), deliberately not attempted from the host.
+//
+// v39 stops taking native tool names the configured mode will never use.
+// Found while building an end-to-end rig on a profile whose host-level tool-fs
+// is ENABLED (the stock `headless` one): DSH did not start at all.
+//
+//     Error: tool "read" is already registered
+//       (for a per-agent variant, register through that agent's `agent.ctx`)
+//         at applyReadTool (dsh-tool-fs/lib/index.js:331)
+//
+//   - The echo registration's `ctx.tools.get(name)` pre-check only sees plugins
+//     that have ALREADY applied. cordis settles siblings with Promise.allSettled,
+//     so a tool-fs that applies LATER finds our name sitting there and throws out
+//     of its own apply. The try/catch around our register() cannot catch that —
+//     the throw is on tool-fs's side — and the whole boot dies with it.
+//   - The web profile hides this because @deepseek-ai/dsh-web-app disables the
+//     host-level tool-fs/tool-bash/tool-fs-search rows (presets remount them on
+//     the agent plane, which is the same fact v38 is about). Any composition
+//     that keeps them enabled will not boot with this plugin mounted.
+//   - v39 gated registration on the display mode, reasoning that only `card`
+//     and `interleave` need to own a name. v40 DELETED that gate: it could not
+//     read the mode at apply time (settings have not loaded; it saw DEFAULTS
+//     'native', watched it degrade for want of the UI patch, and registered
+//     nothing — leaving `interleave` with no echoes to emit), and the rename
+//     made it pointless anyway. See the registration site.
+//   - Verified end to end on 2026-09-15 (probes/e2e-scope.patch.yml then a real
+//     run): agent scope shows the REAL write/edit/read, the inner session writes
+//     and edits for real, and all four cards land as `cc-live-*` tool/call +
+//     tool/result pairs — native names, full arguments, zero ToolArgsError, and
+//     exactly one execution each.
+//
+// v38 CORRECTS v37's diagnosis and actually fixes it. v37 got the shape of the
+// fix right (re-check ownership at emit time, degrade to claude_tool) and the
+// LOOKUP wrong, so its guard could never fire even once:
+//   - v37 blamed load order — "the echo registers `write` first, tool-fs
+//     replaces it later". That cannot happen. NamedEntries.insert THROWS on a
+//     duplicate within one table (core/scope/src/store.ts:43), and nothing
+//     replaces anything. There are simply TWO tables.
+//   - The real cause is SCOPE. This plugin mounts in the host composition, so
+//     its echoes land in the GLOBAL layer. A preset-based deployment mounts
+//     tool-fs / tool-bash on the AGENT plane (presets/*/agent.cordis.yml), so
+//     the real read/write/edit/bash land in that agent's OWN layer. Both live
+//     on happily; ToolRuntime.view() then writes the scope's own layer LAST
+//     and it shadows the inherited global entry (core/tools/src/index.ts:1168).
+//   - So `ctx.tools.get(name)` — no scope, i.e. the GLOBAL view (index.ts:1194)
+//     — keeps answering "yes, still the echo" forever, while execution resolves
+//     through `resolveExecution(name, exec.agent, …)` (index.ts:1536) and gets
+//     the REAL tool. defineTool's wrapper then validates the card-only payload
+//     against that tool's schema and throws ToolArgsError (schema.ts:585-588).
+//   - The second half v37 missed: this is NOT only a write/edit problem.
+//     parameterSchemaSpecToJsonSchema never sets additionalProperties:false
+//     (schema.ts:449-457), so the extra marker keys are accepted and a payload
+//     that happens to cover the required set EXECUTES FOR REAL. read/bash/glob/
+//     grep were not "spared" — they silently ran a second time, per card. Only
+//     write/edit were loud, and only because validation stopped them.
+//   - Fix: judge ownership against THIS REQUEST's declared tools instead of the
+//     global registry view. `options.tools` is projected for the calling scope
+//     (systemPrompt.tools -> wireSchemas(context.scope), index.ts:825; carried
+//     to the adapter by agent-loop/src/agent.ts:379,610-613), and wireSchemas
+//     keeps the live `definition.parameters` reference, so the very same
+//     echoOwnsToolName test now answers the question that actually matters:
+//     "does the name this card is about to claim resolve to OUR echo for the
+//     agent that will execute it?"
+//   - Still explicitly NOT fixed by widening buildEchoArguments: that makes the
+//     call PASS validation, which is how bash/read got their double execution.
+//     probes/echo-ownership-check.mjs keeps that payload deliberately short.
+//   - Structural note, deliberately left in the open: on a preset deployment
+//     every native name is taken in the agent layer, so this guard degrades all
+//     of them to claude_tool. `live` is the only display mode that is correct
+//     by construction there — it appends tool/call + tool/result straight to
+//     the session log and never enters the executor (see createLiveActivitySink).
+//
 // v36 adds `interleave` — real THINK → CARD → THINK → CARD, no DSH patch:
 //   - CORRECTS v35's closing claim. v35 said one-step-per-run was "not fixable
 //     from the plugin" because advancing the step mid-stream breaks the loop's
@@ -424,6 +561,22 @@ export function resolvePermissionMode(value) {
 }
 
 export const TOOL_ACTIVITY_DISPLAYS = ['native', 'fold', 'card', 'live', 'interleave']
+
+/**
+ * Modes whose visible card is appended by the live sink rather than yielded
+ * into the stream (v41).
+ *
+ * `live` has always been here. `interleave` joined because its echo block had
+ * to give up the lowercase wire name to stop colliding with DSH's real tools
+ * (v40), and the lowercase name is exactly what DSH's keyed `tool.call.toolview`
+ * matches on to draw a rich row. Appending the card sidesteps the conflict:
+ * the sink writes it under the lowercase name while the echo keeps the
+ * capitalized one and renders as nothing.
+ *
+ * `card` stays out on purpose — it concludes the turn and keeps its documented
+ * end-of-stream batching, so it has no step boundary to protect.
+ */
+export const SINK_MODES = new Set(['live', 'interleave'])
 
 /**
  * Segment boundary marker (v36, `interleave` only).
@@ -1487,26 +1640,60 @@ export function describeToolActivityFolds(results, useOf, maxChars = DEFAULTS.to
   })
 }
 
-// Echo-card machinery. The client derives a tool card's variant/title/summary
-// from the call NAME and its arguments (TOOL_VARIANTS/SUMMARY_KEYS in
-// dsh-client-ui-tool), so echoing under the variant-compatible lowercase name
-// with native-shaped args yields a real bash/read/search-style card. The
-// `claudeActivity` marker inside the arguments is the durable side-channel
-// that marks a call/result pair as display-only (planReplay and
-// serializeConversation skip it; the payload rides in the persisted arguments
-// so the card's render survives process restarts, like v12).
+// Echo-card machinery. The `claudeActivity` marker inside the arguments is the
+// durable side-channel that marks a call/result pair as display-only (planReplay
+// and serializeConversation skip it; the payload rides in the persisted
+// arguments so the card's render survives process restarts, like v12).
+//
+// v40 renames every echo to the INNER tool's own name — `Bash`, not `bash`.
+// Until v39 these were the DSH lowercase names, chosen because the client keys
+// a card's variant off the call name (TOOL_VARIANTS in dsh-client-ui-tool's
+// tool-call-model.ts:41), so `bash` bought a real terminal-style row. That
+// bargain is what the v37/v38/v39 bugs were all made of: taking a name DSH
+// itself owns means colliding with the tool that owns it, and the collision
+// lands differently at every layer —
+//   · agent plane (preset deployments): the real tool shadows the echo, DSH
+//     validates our card payload against ITS schema → ToolArgsError on
+//     write/edit, silent second execution on bash/read/glob/grep (v38);
+//   · global plane (host-level tool-fs): whoever applies second throws, and
+//     boot dies with it (v39).
+// The capitalised names collide with nothing: DSH tool names are lowercase, and
+// register() enforces no charset at all (core/tools/src/index.ts, only
+// RUN_CODE_NAME is reserved), so `Bash`/`Write`/`Edit` are free in every layer.
+//
+// The price, paid deliberately: TOOL_VARIANTS is an exact case-sensitive lookup
+// (tool-call-model.ts:87), so these fall to the generic `others` row instead of
+// the terminal/read/search rows. That is NOT a regression — v38 already had to
+// degrade every one of them to `claude_tool`, which is the same `others` row
+// with a worse title. This trades a title of "claude_tool" for "Bash" and gets
+// the collision class deleted rather than guarded. Restoring the rich rows is a
+// client-side job (the keyed `tool.call.toolview` slot), not a naming trick.
 const ECHO_MARKER = 'claudeActivity'
-const ECHO_VARIANTS = {
-  Bash: 'bash',
-  Read: 'read',
-  Edit: 'edit',
-  Write: 'write',
-  Glob: 'glob',
-  Grep: 'grep',
-  WebFetch: 'web_fetch',
-  WebSearch: 'web_search',
+export const ECHO_VARIANTS = {
+  Bash: 'Bash',
+  Read: 'Read',
+  Edit: 'Edit',
+  Write: 'Write',
+  Glob: 'Glob',
+  Grep: 'Grep',
+  WebFetch: 'WebFetch',
+  WebSearch: 'WebSearch',
 }
-const ECHO_FALLBACK = 'claude_tool'
+export const ECHO_FALLBACK = 'claude_tool'
+
+/**
+ * v41 `interleave` driver name — the echo block that exists ONLY to hold the
+ * step open while the live sink draws the visible card.
+ *
+ * It is deliberately NOT one of ECHO_VARIANTS. The client plugin hides every
+ * row it keys, and keying the per-tool names would also blank the cards of
+ * sessions recorded under v40, where the capitalized echo WAS the card
+ * (`ToolCallTree`'s `fallback` only applies when NO keyed entry matches, so a
+ * keyed entry that renders nothing leaves an empty row, not the generic card).
+ * One dedicated name that never appeared before keeps history intact and drops
+ * the client to a single key. Since the row is hidden, its name is invisible.
+ */
+export const ECHO_DRIVER = 'ClaudeCodeActivity'
 const ECHO_OUTPUT_MAX_CHARS = 20000
 
 /**
@@ -1537,6 +1724,100 @@ export function buildEchoArguments(ccName, input, output, isError) {
   args.output = line === '' ? '(no output)' : line
   args.isError = isError === true
   return args
+}
+
+/**
+ * v42: the minimal payload for an ECHO_DRIVER block — everything the step cut
+ * needs and nothing else.
+ *
+ * buildEchoArguments above is v16-shaped: back then the echo block WAS the
+ * card, so it had to carry `command` / `file_path` / `output` for the client to
+ * have anything to draw. v41 moved drawing to the live sink (which appends the
+ * real, unclamped arguments under the lowercase wire name) and left the driver
+ * with one job: hold the step open. Its payload was never revisited, so every
+ * driver kept shipping a full copy of the native call — measured at 1179 bytes
+ * average over one real session, 18 of 34 carrying a verbatim shell command.
+ *
+ * That is not merely wasteful. `output` and the marker are `required` in
+ * defineEchoTool's schema, so a fully-populated driver is a block that WOULD
+ * satisfy a real tool's validation if ECHO_DRIVER ever collided with one — the
+ * exact shape that made v37's echoes execute a second time. Shipping only what
+ * the driver needs keeps that door shut by construction.
+ *
+ * Kept: the marker, because isEchoCallBlock filters replayed blocks on it, and
+ * `ccTool`, because it is the one field that makes a hidden row legible when
+ * reading a session log by hand. Dropped: every native payload field, and
+ * `output`'s body — the key stays (schema `required`) with an empty string,
+ * which the echo tool's `render` turns into an empty result nobody reads: the
+ * row is hidden client-side and collectEchoCallIds strips it before replay.
+ */
+export function buildDriverArguments(ccName) {
+  return { [ECHO_MARKER]: true, ccTool: ccName, output: '' }
+}
+
+/**
+ * True when a tool definition or declared schema is one of OUR echo tools.
+ *
+ * Both shapes carry the same field: a ToolDefinition's `parameters` is already
+ * compiled to JSON Schema (core/tools/src/schema.ts:566,572), and the schemas
+ * DSH hands the adapter in `options.tools` reuse that very reference —
+ * wireSchemas projects with `schemaOf(definition, false)`, which does NOT
+ * detach (core/tools/src/index.ts:1246-1256). So the marker lives under
+ * `properties` in either case, and no real harness tool declares it, which
+ * makes its presence an exact ownership test.
+ */
+export function echoOwnsToolName(tool) {
+  return tool?.parameters?.properties?.[ECHO_MARKER] !== undefined
+}
+
+/**
+ * Index one request's declared tool schemas by name (v38).
+ *
+ * Tolerates every degenerate shape on purpose: `options.tools` is OMITTED
+ * entirely when the calling scope declares no tools (agent-loop/src/agent.ts:565
+ * only spreads it while `tools.length > 0`), and a missing index must read as
+ * "nothing is ours" rather than throw inside a display path.
+ */
+export function indexRequestTools(requestTools) {
+  const declared = new Map()
+  if (!Array.isArray(requestTools)) return declared
+  for (const schema of requestTools) {
+    if (typeof schema?.name === 'string' && schema.name.length > 0) declared.set(schema.name, schema)
+  }
+  return declared
+}
+
+/**
+ * Pick the echo tool name this card may safely claim, for ONE request (v38).
+ *
+ * Two conditions, and both are load-bearing:
+ *   · `owned` — we successfully registered that name at startup.
+ *   · `declared` — and the agent about to execute this call still resolves that
+ *     name to OUR echo. This is the half v37 lacked: registration happens in
+ *     the global layer, execution resolves through the agent's layer, and a
+ *     preset that mounts tool-fs on the agent plane shadows the name without
+ *     ever touching our registration.
+ *
+ * Null means "no echo card for this run" — the caller falls back to a reasoning
+ * fold, so the run stays visible instead of failing a real tool's validation.
+ * @param onDegrade - notified once per name that was ours to register but is not ours to call.
+ * @param preferDriver - v41: a live sink is drawing the card, so this block is
+ *   only a step driver and should claim ECHO_DRIVER, whose row the client hides.
+ */
+export function resolveEchoName(ccName, declared, owned, onDegrade, preferDriver = false) {
+  const usable = (name) => {
+    if (typeof name !== 'string' || !owned.has(name)) return false
+    if (echoOwnsToolName(declared.get(name))) return true
+    onDegrade?.(name)
+    return false
+  }
+  // Falling through to a per-tool variant is intentional: if the driver name is
+  // somehow unusable the run still gets a v40-shaped visible card rather than
+  // losing the step cut and the card together.
+  if (preferDriver && usable(ECHO_DRIVER)) return ECHO_DRIVER
+  const preferred = ECHO_VARIANTS[ccName]
+  if (usable(preferred)) return preferred
+  return usable(ECHO_FALLBACK) ? ECHO_FALLBACK : null
 }
 
 /** True when a tool-call block is one of our display-only echoes. */
@@ -1686,14 +1967,34 @@ export function findOpenStep(session) {
  * The client keys its rich tool views off the wire name alone
  * (`tool.call.toolview` slot key, and `TOOL_VARIANTS` for the generic row), so
  * this map is what turns a run into a read row, a bash row or a diff row
- * instead of the unclassified `others` row. Same table `card` mode uses, for
- * the same reason.
+ * instead of the unclassified `others` row.
+ *
+ * v40 SPLIT this from ECHO_VARIANTS, which it used to share. The two tables
+ * answer different questions and only looked alike:
+ *   · here the name is written straight into the session log and read by the
+ *     client. Nothing registers it, nothing executes it, so naming it `read`
+ *     costs nothing and buys the rich row.
+ *   · ECHO_VARIANTS names a tool that DSH will REGISTER and EXECUTE, where
+ *     `read` means colliding with tool-fs — the v37→v39 bug family.
+ * Sharing one table meant `live` was paying for `card`'s constraint, or (after
+ * the v40 rename) would silently have lost its rich rows. Keep them apart.
  *
  * An unmapped name is passed through UNCHANGED rather than forced onto a
  * fallback: an honest tool name on a generic row beats a wrong card.
  */
+const LIVE_WIRE_NAMES = {
+  Bash: 'bash',
+  Read: 'read',
+  Edit: 'edit',
+  Write: 'write',
+  Glob: 'glob',
+  Grep: 'grep',
+  WebFetch: 'web_fetch',
+  WebSearch: 'web_search',
+}
+
 export function liveWireToolName(ccName) {
-  return ECHO_VARIANTS[ccName] ?? ccName
+  return LIVE_WIRE_NAMES[ccName] ?? ccName
 }
 
 /**
@@ -1857,7 +2158,15 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
           type: 'tool-call',
           id: use.id,
           name: echoName,
-          arguments: JSON.stringify(buildEchoArguments(bridgeDisplayName(use.name), use.input, output, isError)),
+          // v42: ECHO_DRIVER means a live sink already drew the card with the
+          // real arguments, so this block is a step cut and nothing more. Every
+          // other echo name IS the card (`card` mode, or a sink-less fallback),
+          // and still needs the native-shaped payload to render.
+          arguments: JSON.stringify(
+            echoName === ECHO_DRIVER
+              ? buildDriverArguments(bridgeDisplayName(use.name))
+              : buildEchoArguments(bridgeDisplayName(use.name), use.input, output, isError),
+          ),
         },
       },
     ]
@@ -1975,12 +2284,22 @@ export async function* translateSdkMessages(messages, { showToolActivity = true,
             // Map before choosing the variant: a bridged `mcp__dsh__bash` has
             // to land on ECHO_VARIANTS' `Bash` entry, not the generic
             // fallback, or the swap would be visible as a plainer card.
-            const echoName = echoNameOf(bridgeDisplayName(use.name))
+            const echoName = echoNameOf(bridgeDisplayName(use.name), activitySink !== undefined)
             if (echoName === null) {
               // Name collision or registration failure: this run still gets a
               // real-time fold instead of a card it could not safely claim.
               yield* emitFoldBlock(describeToolActivityFolds([block], useOf, toolResultDisplayChars)[0])
             } else {
+              // v41: when a sink is available (interleave with a live session),
+              // IT draws the visible card — under the lowercase wire name, so
+              // DSH's own keyed toolview gives it the rich row the capitalized
+              // echo name cannot match. The echo block below then exists only
+              // to hold the step open, and the client plugin renders it as
+              // nothing. Without a sink this is skipped and the echo block is
+              // the card, exactly as in v40.
+              if (activitySink !== undefined) {
+                activitySink.tool(use, resultText(block?.content, toolResultDisplayChars), block?.is_error === true)
+              }
               yield* emitActivityCardChunk(use, echoName, resultText(block?.content, toolResultDisplayChars) || '(no output)', block?.is_error === true)
               // v36 `interleave`: cut the stream HERE. DSH appends tool/call
               // only in executeToolCalls, i.e. after a stream ends — so one
@@ -2756,8 +3075,29 @@ export function apply(ctx, rawConfig = {}) {
       return { recorded: true }
     },
   })
+  // Registered unconditionally, and v39's attempt to gate this on the display
+  // mode is DELETED rather than repaired. Two reasons, in order of weight:
+  //
+  //   1. It cannot read the mode here. `config()` is `{...DEFAULTS, ...current()}`
+  //      and the settings document has not loaded at apply time, so the gate saw
+  //      DEFAULTS.toolActivityDisplay ('native'), watched degradeToolActivityDisplay
+  //      knock it down to a fold for want of the UI patch, and skipped
+  //      registration — leaving `interleave` with no echoes to emit. Observed
+  //      2026-09-15 via probes/e2e-scope.patch.yml: settings said `interleave`,
+  //      the agent scope showed `echo tools registered: (none)`.
+  //   2. Its whole purpose is gone. v39 gated registration to avoid the
+  //      duplicate-insert crash; v40's rename put these names outside DSH's
+  //      namespace, so there is nothing left to crash into.
+  //
+  // Registering eight display tools that a fold-only deployment never emits is
+  // mild catalog noise, and it is the behaviour v16–v38 shipped. Trading a
+  // correctness bug for that noise was the wrong trade.
+  //
+  // The `ctx.tools.get()` pre-check stays. It is one lookup per name, and it is
+  // the only thing standing between a future rename back into DSH's namespace
+  // and a silent repeat of v37 → v39.
   const ownedEchoNames = new Set()
-  for (const name of new Set([...Object.values(ECHO_VARIANTS), ECHO_FALLBACK])) {
+  for (const name of new Set([...Object.values(ECHO_VARIANTS), ECHO_FALLBACK, ECHO_DRIVER])) {
     if (ctx.tools.get(name) !== undefined) continue
     try {
       ctx.tools.register(defineEchoTool(name))
@@ -2766,12 +3106,43 @@ export function apply(ctx, rawConfig = {}) {
       logger.warn(`llm-claude-code: echo tool "${name}" unavailable (${error?.message ?? error})`)
     }
   }
-  // Null means "no echo card for this run" — translateSdkMessages falls back
-  // to a reasoning fold for that run, so the run is still visible.
-  const echoNameOf = (ccName) => {
-    const preferred = ECHO_VARIANTS[ccName]
-    if (typeof preferred === 'string' && ownedEchoNames.has(preferred)) return preferred
-    return ownedEchoNames.has(ECHO_FALLBACK) ? ECHO_FALLBACK : null
+  // v38: the registration-time guard above is necessary but NOT sufficient,
+  // and — unlike what v37 assumed — re-asking ctx.tools.get() does not help.
+  //
+  // That call carries no scope, so it answers from the GLOBAL view
+  // (core/tools/src/index.ts:1194), which is exactly where our echoes live and
+  // where they stay ours forever. Execution resolves through the AGENT's view
+  // instead (index.ts:1536), and a preset mounting tool-fs on the agent plane
+  // shadows `write`/`edit`/`read`/`bash` there without disturbing our global
+  // registration at all — two separate tables, no duplicate, no replacement
+  // (core/scope/src/store.ts:43). The global check therefore returns true on
+  // every single call and degrades nothing.
+  //
+  // What the card must ask is a per-request question, so it is answered from
+  // per-request data: `options.tools` is projected for the calling scope and is
+  // the same view that will execute the call. See resolveEchoName.
+  //
+  // Widening buildEchoArguments to satisfy the real schemas remains the WRONG
+  // fix, and v38 is the proof: the payload for bash/read/glob/grep ALREADY
+  // covers their required set, additionalProperties is never closed
+  // (core/tools/src/schema.ts:449-457), and those cards were silently running
+  // the real tool a second time. Failing validation is what kept write/edit
+  // from doing the same.
+  const lostEchoNames = new Set()
+  const noteEchoLost = (name) => {
+    if (lostEchoNames.has(name)) return
+    lostEchoNames.add(name)
+    logger.warn(
+      `llm-claude-code: echo name "${name}" resolves to another tool in the calling agent's scope `
+        + `(a preset likely mounts it on the agent plane) — cards for it degrade to "${ECHO_FALLBACK}"`,
+    )
+  }
+  // Built once per request: the scope, and therefore the answer, belongs to
+  // that request. Null means "no echo card for this run" — translateSdkMessages
+  // falls back to a reasoning fold, so the run is still visible.
+  const buildEchoNameOf = (requestTools) => {
+    const declared = indexRequestTools(requestTools)
+    return (ccName, preferDriver) => resolveEchoName(ccName, declared, ownedEchoNames, noteEchoLost, preferDriver)
   }
 
   const adapter = {
@@ -3050,7 +3421,16 @@ export function apply(ctx, rawConfig = {}) {
         // `live` writes its cards into THIS session's log, so it needs the live
         // Session object. Resolved per attempt (a resume retry re-enters here)
         // and left undefined for every other mode, which touches no session.
-        const activitySink = resolveToolActivityDisplay(resolved.toolActivityDisplay) === 'live'
+        //
+        // v41 adds `interleave` to that set. This does NOT make interleave a
+        // second live mode: it still cuts the stream on an unexecuted echo to
+        // win its step boundary. The sink only takes over the VISIBLE card,
+        // under the lowercase wire name, so DSH's own keyed toolview draws the
+        // rich row — the echo block keeps the capitalized name that makes it
+        // collision-free and renders as nothing (src/client/index.js).
+        // No sink (no live session) degrades interleave to its v40 shape:
+        // the echo block is the card again, generic row and all.
+        const activitySink = SINK_MODES.has(resolveToolActivityDisplay(resolved.toolActivityDisplay))
           && typeof options.sessionId === 'string' && options.sessionId.length > 0
           ? createLiveActivitySink({ session: sessions.get(options.sessionId), logger, model: options.model })
           : undefined
@@ -3081,7 +3461,9 @@ export function apply(ctx, rawConfig = {}) {
             showToolActivity: resolved.showToolActivity,
             toolActivityDisplay: resolveToolActivityDisplay(resolved.toolActivityDisplay),
             toolResultDisplayChars: resolved.toolResultDisplayChars,
-            echoNameOf,
+            // v38: scoped to THIS request's declared tools, not the global
+            // registry view — see buildEchoNameOf.
+            echoNameOf: buildEchoNameOf(options.tools),
             onResult: (result) => {
               if (typeof result?.session_id !== 'string' || result.session_id.length === 0) return
               if (resuming) {

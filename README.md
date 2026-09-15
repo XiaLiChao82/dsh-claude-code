@@ -163,21 +163,27 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 
 | 模式 | 行为 | 实时 | 文字与卡片穿插 | 文字逐字流 | 界面补丁 | 持久化白名单 |
 | --- | --- | --- | --- | --- | --- | --- |
-| `interleave` | 每次内层工具调用切一个 DSH **step**，卡片与文字各占独立助手消息 | 是 | **是** | 是 | 不需要 | 不需要 |
+| `interleave` | 卡片按 `live` 的方式追加进会话日志，另发一个隐藏的驱动块切一个 DSH **step**，使文字与卡片各占独立助手消息 | 是 | **是** | 是 | 不需要 | 不需要 |
 | `live` | 直接向当前会话日志追加标准 `tool/call` + `tool/result` 事件，由原版 UI 渲染为原生工具卡片 | 是 | 否（文字集中在所有卡片之后） | 是 | 不需要 | 不需要 |
 | `native` | 按 SDK 消息顺序输出专用 `tool-activity` 内容块；默认值 | 是 | 是 | 是 | 需要 | 需要 |
 | `fold` | 将已完成的工具活动输出为可折叠的 reasoning 内容块 | 是 | 是 | 是 | 不需要 | 不需要 |
 | `card` | 输出标准 DSH `tool-call` 回显卡片；卡片在外层 LLM 流结束后统一执行和显示 | 否 | 否（卡片全部批在流末） | 是 | 不需要 | 不需要 |
 
-### `interleave` 模式（v36）
+### `interleave` 模式（v36 切段机制；v41 起卡片与驱动分离）
 
 唯一同时做到「顺序正确 + 内容完整 + 原生卡片 + 无需补丁」的模式，代价是每张卡片多一个 DSH step。
 
-原理是**把一次内层运行切成多个 step**，而不是试图在一条流里提前画卡片（后者做不到，见下方 `card` 的说明）。适配器在吐出一个 echo `tool-call` 之后立即结束本段流，于是：
+原理是**把一次内层运行切成多个 step**，而不是试图在一条流里提前画卡片（后者做不到，见下方 `card` 的说明）。适配器在吐出一个 `tool-call` 之后立即结束本段流，于是：
 
-1. loop 执行这个 echo（`executeToolCalls`）→ 画出原生卡片；
-2. echo **不**调用 `concludeTurn()`，loop 因而欠一次后续请求 → 打开新的 step；
-3. 适配器从**挂起的生成器**里接着吐下一段，不重跑 Claude Code。
+1. loop 执行这个块（`executeToolCalls`）→ 它**不**调用 `concludeTurn()`，loop 因而欠一次后续请求 → 打开新的 step；
+2. 适配器从**挂起的生成器**里接着吐下一段，不重跑 Claude Code。
+
+**v41 起，画卡片与切 step 由两条记录分担**（见下方「回显块不得占用 DSH 工具名」）：
+
+- **卡片**走 `live` 的 `session.append` 路径，用小写名（`bash`/`write`/`edit`），命中 DSH 原生 keyed toolview → 富卡片，不经执行器；
+- **驱动块**叫 `ClaudeCodeActivity`，是真 tool-call，只负责切 step；客户端插件为这个名字注册一个渲染为空的 toolview，并注入一条 `:has()` 规则把整行收掉，所以界面上看不到它。
+
+v41 之前由同一个回显块兼任两职，那正是回显块必须叫 `bash`/`write` 这类原生名的原因，也是一连串故障的根源。
 
 关键点：
 
@@ -185,9 +191,26 @@ Claude Code 路由下的 `/goal` 依赖 `nativeResume`，且必须先建立一�
 - **`concludeTurn()` 是开关。** `card` 模式的 echo 仍然调用它（那里 echo 是本轮最后一件事，多一次请求纯属浪费）；`interleave` 不调用，换来的后续请求正是它要的。见 DSH `loop.spec.ts` 的 `a tool can conclude the turn despite owing a follow-up request`。
 - **挂起期间持有真实子进程。** `interleaveState` 存着半消费的生成器和它背后的 Claude Code query。四条路径都会释放它：最后一段流干、来了非续传请求、abort、以及看门狗超时（120 秒，防止 loop 不再要求下一段却没通知适配器）。
 - **续传识别看最后一条消息**：只有「整条消息就是一个 echo 结果」才算续传（`isEchoContinuation`）。真实用户消息、steering、普通工具结果都不算，因此挂起的运行不可能劫持新输入。
-- **名字冲突时不切段。** echo 名被真实工具占用时该次运行降级为 fold，而 fold 不可执行——在那里切段会留下一个没有工具可执行的 step，导致回合提前结束。
+- **名字判不出归属时不切段。** 驱动名在本次请求的工具表里解析不到我们自己的定义时，该次运行降级为 fold，而 fold 不可执行——在那里切段会留下一个没有工具可执行的 step，导致回合提前结束。v40 起驱动名已移出 DSH 的命名空间，正常情况下不会触发，这条是安全网。
 
 离线自检：`node probes/interleave-check.mjs`（33 项）断言分段边界、`SEGMENT_BREAK` 不外泄、挂起生成器精确续传、文字落在正确的段、末段报告耗尽以便释放资源、fold 降级不切段、`segmented:false` 与 v16 `card` 逐字节一致，以及续传识别的六种情形。其中 `THINK → TOOL → THINK → TOOL ordering, one step each` 一项直接锁定顺序契约。
+
+### 回显块不得占用 DSH 工具名（v37–v42 的根因）
+
+DSH 主循环看见 `tool-call` 块就**真的执行**它。所以为显示而注入的回显块，一旦叫了 DSH 已有的工具名（`bash`/`write`/`edit`/`read`…），同一个名字会在不同层长出两张脸：
+
+- **agent 层**——preset 把 `tool-fs`/`tool-bash` 挂在 agent 平面（`presets/*/agent.cordis.yml`），真工具遮蔽全局层的回显 → 回显参数被拿去过真工具的 schema → `write`/`edit` 报 `invalid arguments: missing required property "content"`；
+- **全局层**——host 组合若启用了 `tool-fs`（如 DSH 自带的 `headless`），谁后注册谁抛 `tool "read" is already registered`，**整个 boot 失败**；
+- **参数恰好合法时**——`parameterSchemaSpecToJsonSchema` 不带 `additionalProperties: false`（`core/tools/src/schema.ts`），多余字段一律放行，于是 `bash`/`read`/`glob`/`grep` 的回显**被静默执行第二遍**。
+
+三个症状同源。四条约束由此而来：
+
+1. **回显名必须在 DSH 的命名空间之外。** DSH 工具名全为小写，而 `register()` 不校验字符集（`core/tools/src/index.ts` 只保留 `RUN_CODE_NAME`），所以首字母大写是免费的无冲突命名空间。
+2. **所有权判定必须用本次请求的 `options.tools`**，不能用 `ctx.tools.get(name)`——后者不带 scope，拿到的是全局视图，而执行时用的是 agent 视图（`resolveExecution(name, exec.agent, …)`），两者可以完全不同。
+3. **驱动块不得携带真实载荷**（v42）。载荷齐全的块本身就是一个「能通过真工具校验」的形状，正是被执行第二遍时的样子。只留标记 `claudeActivity`、排查用的 `ccTool`，和 schema 要求的空 `output`。
+4. **要富卡片就用小写名走 `session.append`。** DSH 的富卡片是 keyed toolview 注册的（`bash-sample.tsx` 注册 `key:'bash'`、`file-mutation-row.tsx` 注册 `'edit'`/`'write'`），不是 `TOOL_VARIANTS` 查表——后者只是 `GenericToolCard` 内部挑通用行外观用的。append 路径不注册、不经执行器，撞名的两个成因一个都不沾，所以在那里用小写名是安全的。
+
+离线自检：`node probes/echo-ownership-check.mjs`（56 项）把这四条全部锁死，其中「回显名不得落入 DSH 小写命名空间」和「驱动块不得携带真实载荷」是绊线——有人改回去就会失败。
 
 ### `live` 模式（v33 卡片；v34 的穿插已于 v35 撤销）
 
@@ -412,6 +435,9 @@ node checkup.mjs --live
 | `checkup.mjs --live` | 在静态检查之外启动真实 Claude Code 会话，验证 SDK 输出格式及原生工具行为 |
 | `probes/live-sink-check.mjs` | `live` 模式的离线断言：事件形状、callId 一致、turn/step 归属，以及 v35 的「全部文字留在流里」契约；当前为 31 项 |
 | `probes/interleave-check.mjs` | `interleave` 模式的离线断言：分段边界、挂起生成器续传、顺序契约、fold 降级不切段、续传识别；当前为 33 项 |
+| `probes/echo-ownership-check.mjs` | 回显块名字与载荷的守卫：v38 按请求作用域判定归属、v40 锁死回显名不得落入 DSH 的小写命名空间、v42 锁死驱动块不得携带真实载荷（携带即可能被 DSH 真的执行第二次）；当前为 56 项 |
+| `probes/client-driver-check.mjs` | 客户端插件的离线断言：host 与 client 两份 bundle 的驱动名不得漂移、CSS 规则插值正确、disposer 清理注入的 `<style>`；当前为 16 项 |
+| `probes/mount-probe.mjs` | 只读挂载探针（配 `mount-probe.patch.yml`）：确认 `apply()` 跑到最后一行、LLM 路由已注册，并可选打印 agent 作用域的工具视图；不发 LLM 请求 |
 | `probes/`（两阶段，见 [probes/README.md](probes/README.md)） | 用生产驱动写出真实子会话再由全新进程冷读，验证镜像事件形状能过还原校验 |
 
 升级 DSH、Claude Code 或 Claude Agent SDK 后，至少运行前两项。模拟测试无法发现 DSH 内部服务改名等兼容性变化，因此不能替代 `checkup.mjs`；`checkup.mjs` 也不检查会话事件形状能否被还原校验接受，那一层只有 `probes/` 覆盖。
@@ -429,6 +455,9 @@ node checkup.mjs --root /path/to/dsh/node_modules/@deepseek-ai
 | `index.js` | npm 包稳定入口，导出 `main.v20.mjs` 的命名导出 |
 | `main.v20.mjs` | 插件实现：Adapter、消息转换、工具桥接、权限映射、续接及命令处理 |
 | `main.v29.mjs` | 手工挂载开发使用的兼容转发入口，不包含独立实现 |
+| `src/client/` | 客户端插件源码：为驱动块 `ClaudeCodeActivity` 注册渲染为空的 toolview，并注入收掉整行的 CSS。`driver-names.js` 是与 host 共享的纯数据，无 React 依赖以便探针直接 import |
+| `scripts/build-client.mjs` | 用 esbuild 把 `src/client/` 打成 `lib/client.js`；仅 React 外置，其余内联。**改了 `src/client/` 必须重跑** |
+| `lib/client.js` | 客户端 bundle 构建产物。入库是必要的：`exports["./client"]` 指向它，而本工作区的 `node_modules` 是手工软链、`npm install` 不可用 |
 | `cordis.patch.yml` | DSH bundle 配置补丁，负责插件注册和同名命令替换 |
 | `checkup.mjs` | 面向真实 DSH 安装的兼容性检查 |
 | `verify-compact.mjs` | 面向模拟环境的逻辑与回归测试 |

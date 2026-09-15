@@ -1,0 +1,43 @@
+# headless 端到端验证 overlay：把 headless 的工具平面对齐成 web 的形态。
+#
+# 为什么非对齐不可——两者恰好相反，不对齐就等于在测一个不存在的部署：
+#
+#   host 层的 tool-fs / tool-bash / tool-fs-search / tool-jobs / tool-pwsh
+#     · web      → @deepseek-ai/dsh-web-app 把它们全部 disabled，改由
+#                  agent preset 在 **agent 平面** 挂载；
+#     · headless → 全部启用，注册在 **全局层**。
+#
+# 这一条差别决定了整个 bug 的舞台：只有 web 那种形态下，全局层的 write/edit
+# 名字是空的，插件的回显工具才能占住它们（不撞重名），而真正执行时又在 agent
+# 层解析到 tool-fs 的真 write —— 于是 v37 那个不带 scope 的 ctx.tools.get()
+# 永远看见自己。headless 原样跑只会走到「名字已被占用、跳过注册」的另一条分支，
+# 测不出任何东西。
+#
+# 用法：
+#   dsh --profile cc-headless --patch probes/e2e-live.patch.yml "……"
+
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+
+# web 的这一行由 @deepseek-ai/dsh-web-app 贡献（config.default: standard）。
+# headless 没有，补上——它才是把 tool-fs/tool-bash 挂到 agent 平面的那一行。
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
+# agent 作用域取样器：打印 agent 真正看见的工具视图后立刻退出，不发 LLM 请求。
+- insert:
+    - id: cc-mount-probe
+      name: ./mount-probe.mjs
+      config:
+        exitOnAgent: true

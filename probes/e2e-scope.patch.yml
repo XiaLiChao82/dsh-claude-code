@@ -1,0 +1,7 @@
+# 只插取样器：打印 agent 作用域的工具视图后立刻退出，不发 LLM 请求。
+# 用来在真正花钱跑端到端之前，确认内层拿到的是真工具还是回显。
+- insert:
+    - id: cc-mount-probe
+      name: ./mount-probe.mjs
+      config:
+        exitOnAgent: true

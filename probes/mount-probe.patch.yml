@@ -1,0 +1,11 @@
+# mount-probe 的 overlay：只往隔离 profile 里插一行只读探针。
+#
+# 用法（绝不要指向用户正在用的 web profile，启动会重写它的 cordis.yml）：
+#   dsh --profile cc-verify --port 3081 --no-open \
+#       --patch ~/Workspaces/Agent/DSH-Plugin/llm-claude-code/probes/mount-probe.patch.yml
+#
+# 层序上 --patch 排在最后，所以这一行一定排在 llm-claude-code 之后挂载；
+# 即便如此探针内部仍然延后 5s 才取样，见 mount-probe.mjs 的说明。
+- insert:
+    - id: cc-mount-probe
+      name: ./mount-probe.mjs
